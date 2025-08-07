@@ -1,0 +1,9 @@
+# RStudio files
+.Rhistory
+.RData
+.Rproj.user/
+
+# renv local libraries
+renv/library/
+
+~$*

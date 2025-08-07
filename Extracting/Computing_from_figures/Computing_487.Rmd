@@ -1,0 +1,50 @@
+---
+title: "Computing_487"
+author: "Lisa Mijares"
+date: "2025-06-10"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(drc)
+```
+
+```{r}
+setwd("C:/Users/lisam/OneDrive - University College London/Documents/Project/4_Full_text")
+set.seed(42)
+```
+
+```{r}
+# Getting the data 
+raw_data <- read_csv("Articles/487_formatted.csv")
+
+# Transforming the upper and lower bound into a CE, by getting the mean of the upper and lower
+
+data <- raw_data %>%
+  mutate(SE = ((Response_mean - Response_SE_low) + (Response_SE_up - Response_mean))/2) %>%
+  # Modyifing so no SE = 0 
+  mutate(SE = ifelse(SE == 0, SE + 0.05, SE)) %>%
+  mutate(Weight = (1/(SE^2)))
+
+data_form <- data %>%
+  filter(Treatment == "Formulation")
+
+data_ai <- data %>%
+  filter(Treatment == "AI")
+```
+
+```{r}
+mod_form <- drm(Response_mean ~ Dose, data = data_form, fct = LL.3())
+plot(mod_form)
+
+ED(mod_form, 50)
+```
+```{r}
+mod_ai <- drm(Response_mean ~ Dose, data = data_ai, fct = LL.3())
+plot(mod_ai)
+
+ED(mod_ai, 50)
+```
+
+

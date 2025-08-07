@@ -1,0 +1,204 @@
+---
+title: "Agreement"
+author: "Lisa Mijares"
+date: "2025-04-25"
+output:
+  html_document:
+    df_print: paged
+---
+
+In this markdown, I screen 100 random papers from Guy's extraction to determine an agreement score. 
+
+```{r}
+library(tidyverse)
+library(metagear)
+```
+
+```{r, results=FALSE}
+#Setting directories and seed
+set.seed(42)
+```
+
+```{r}
+# Getting the data 
+wos_guy <- read_csv("Guys_data/effort_Guy_wos.csv")
+scopus_guy <- read_csv("Guys_data/effort_Guy_scopus.csv")
+review1 <- read_csv("Guys_data/effort_Guy_cox_review_cited.csv")
+review2 <- read_csv("Guys_data/effort_Guy_cox_review_refs.csv")
+review3 <- read_csv("Guys_data/effort_Guy_nagy_review_cited.csv")
+review4 <- read_csv("Guys_data/effort_Guy_nagy_review_refs.csv")
+```
+
+```{r}
+# Formatting the data and blinding it 
+
+review1 <- review1 %>%
+    mutate(VOLUME = as.numeric(VOLUME),
+         LPAGES = as.character(LPAGES),
+         UPAGES = as.character(UPAGES))
+
+
+review2 <- review2 %>%
+    mutate(VOLUME = as.numeric(VOLUME),
+         LPAGES = as.character(LPAGES),
+         UPAGES = as.character(UPAGES))
+
+
+review3 <- review3 %>%
+    mutate(VOLUME = as.numeric(VOLUME),
+         LPAGES = as.character(LPAGES),
+         UPAGES = as.character(UPAGES))
+
+
+review4 <- review4 %>%
+    mutate(VOLUME = as.numeric(VOLUME),
+         LPAGES = as.character(LPAGES),
+         UPAGES = as.character(UPAGES))
+
+
+wos_guy<- wos_guy %>%
+    mutate(VOLUME = as.numeric(VOLUME),
+         LPAGES = as.character(LPAGES),
+         UPAGES = as.character(UPAGES))
+
+scopus_guy<- scopus_guy %>%
+    mutate(VOLUME = as.numeric(VOLUME),
+         LPAGES = as.character(LPAGES),
+         UPAGES = as.character(UPAGES))
+
+blind <- scopus_guy %>%
+  bind_rows(wos_guy, review1, review2, review3, review4) %>% 
+  filter(INCLUDE != "maybe") %>%
+  drop_na(STUDY_ID) %>%
+  select(AUTHORS, TITLE, JOURNAL, ABSTRACT, YEAR) %>% 
+  distinct() %>%
+  mutate(BLIND_ID = seq(1:6273))
+
+full <- scopus_guy %>%
+  bind_rows(wos_guy, review1, review2, review3, review4) %>% 
+  filter(INCLUDE != "maybe") %>%
+  drop_na(STUDY_ID) %>%
+  distinct()
+```
+
+```{r}
+# Picking a hundred random studies 
+
+rd_numbers <- sample(1:6273, 100)
+
+hund_rd_studies <- blind %>%
+  filter(BLIND_ID %in% rd_numbers)
+```
+
+
+```{r}
+# Using metagear to screen the studies 
+effort_distribute(hund_rd_studies,
+                  reviewers = "Lisa", 
+                  initialize = TRUE,
+                  save_split = TRUE)
+```
+
+
+```{r, eval=FALSE}
+abstract_screener("effort_Lisa.csv",
+                  "Lisa",
+                  highlightKeywords = c("toxic", "effect", "mortal", "viab", "endpoint", "end point", "oxid",
+                                        "cell cycle", "dna damage", "apop", "necro", "sensitiv", "growth", "surviv",
+                                        "aberra", "health", "fitness", "output", "reproduct", "develop", "behaviour",
+                                        "behavior", "fecundity", "offspring", "pesticid", "herbicid", "insecticid",
+                                        "fungicid", "acaricid", "miticid", "nematicid", "molluscicid", "rodenticid",
+                                        "agrochem", "active ingredient", "active substance", "active principle",
+                                        "active component", "active constituent", "active pesticide", "active agent",
+                                        "active compound", "pure ingredient", " pure substance", "pure principle",
+                                        "pure component", "pure constituent", "pure pesticide", "pure agent",
+                                        "pure compound", "technical ingredient", "technical substance",
+                                        "technical principle", "technical component", "technical constituent",
+                                        "technical pesticide", "technical agent", "technical compound",
+                                        "technical grade", "fundamental substance", "co formulant", "formulation",
+                                        "formulant", "formulated", "commercial form", "commercial product",
+                                        "commercial mixture", "inactive ingredient", "inert ingredient",
+                                        "adjuvant", "safener", "additive", "surfactant", "technical formulation",
+                                        "technical mixture"))
+```
+
+```{r}
+# Tackling the maybes 
+blind_screened <- read_csv("effort_Lisa.csv")
+
+# Save it
+
+blind_maybes <- blind_screened %>%
+  filter(INCLUDE == "maybe")%>%
+  mutate(INCLUDE = str_replace_all(INCLUDE, "maybe", "not vetted"))
+
+write_csv(blind_maybes, "effort_Lisa_maybes.csv")
+
+
+```
+
+```{r}
+# Screening the maybes again
+abstract_screener("effort_Lisa_maybes.csv",
+                  "Lisa",
+                  highlightKeywords = c("toxic", "effect", "mortal", "viab", "endpoint", "end point", "oxid",
+                                        "cell cycle", "dna damage", "apop", "necro", "sensitiv", "growth", "surviv",
+                                        "aberra", "health", "fitness", "output", "reproduct", "develop", "behaviour",
+                                        "behavior", "fecundity", "offspring", "pesticid", "herbicid", "insecticid",
+                                        "fungicid", "acaricid", "miticid", "nematicid", "molluscicid", "rodenticid",
+                                        "agrochem", "active ingredient", "active substance", "active principle",
+                                        "active component", "active constituent", "active pesticide", "active agent",
+                                        "active compound", "pure ingredient", " pure substance", "pure principle",
+                                        "pure component", "pure constituent", "pure pesticide", "pure agent",
+                                        "pure compound", "technical ingredient", "technical substance",
+                                        "technical principle", "technical component", "technical constituent",
+                                        "technical pesticide", "technical agent", "technical compound",
+                                        "technical grade", "fundamental substance", "co formulant", "formulation",
+                                        "formulant", "formulated", "commercial form", "commercial product",
+                                        "commercial mixture", "inactive ingredient", "inert ingredient",
+                                        "adjuvant", "safener", "additive", "surfactant", "technical formulation",
+                                        "technical mixture"))
+
+```
+```{r}
+# Replace the maybes by the decision
+
+maybes_decision <- read_csv("effort_Lisa_maybes.csv")
+
+blind_final <- blind_screened %>%
+  filter(INCLUDE != "maybe") %>%
+  bind_rows(maybes_decision) %>%
+  rename(INCLUDE_LISA = INCLUDE)
+
+# Joining the new decision 
+
+original_decisions <- semi_join(full, hund_rd_studies)
+
+comparing <- original_decisions %>%
+  select(TITLE, INCLUDE) %>%
+  rename(INCLUDE_GUY = INCLUDE) %>%
+  left_join(blind_final) %>%
+  distinct()
+
+
+```
+```{r}
+# Computing a score 
+
+score <- comparing %>%
+  filter(INCLUDE_GUY == INCLUDE_LISA) %>%
+  count()
+
+# Which studies are different?
+different <- comparing %>%
+  filter(INCLUDE_GUY != INCLUDE_LISA)
+
+```
+
+```{r}
+# Saving everything 
+
+write_csv(comparing, "effort_compared.csv")
+write_csv(different, "effort_different.csv")
+```
+

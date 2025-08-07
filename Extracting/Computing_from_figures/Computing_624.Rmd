@@ -1,0 +1,66 @@
+---
+title: "Computing_624"
+author: "Lisa Mijares"
+date: "2025-06-10"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(drc)
+```
+
+```{r}
+setwd("C:/Users/lisam/OneDrive - University College London/Documents/Project/4_Full_text")
+set.seed(42)
+```
+
+```{r}
+# Getting the data 
+raw_data <- read_csv("Articles/624.csv")
+
+# Separating into smaller datasets
+
+calypso <- raw_data %>%
+  filter(Treatment == "Calypso")
+
+frontier <- raw_data %>%
+  filter(Treatment == "Frontier")
+
+filon <- raw_data %>%
+  filter(Treatment == "Filon")
+
+sumialfa <- raw_data %>%
+  filter(Treatment == "Sumialfa")
+```
+
+```{r}
+
+mod_cal <- drm(Response_mortality ~ Dose, data = calypso, fct = LL.4())
+plot(mod_cal)
+
+ED(mod_cal, 50)
+```
+
+```{r}
+mod_fil <- drm(Response_mortality ~ Dose, data = filon, fct = LL.4())
+plot(mod_fil)
+
+ED(mod_fil, 50)
+```
+
+```{r}
+mod_fro <- drm(Response_mortality ~ Dose, data = frontier, fct = LL.4())
+plot(mod_fro)
+
+ED(mod_fro, 50)
+
+```
+
+```{r}
+mod_sum <- drm(Response_mortality ~ Dose, data = sumialfa, fct = LL.4())
+plot(mod_sum)
+
+ED(mod_sum, 50)
+```
+

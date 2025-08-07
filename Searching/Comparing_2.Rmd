@@ -1,0 +1,185 @@
+---
+title: "Comparing_2"
+author: "Lisa Mijares"
+date: "2025-05-15"
+output: html_document
+---
+
+In this notebook, I compare the results of my literature search to the one done by Guy in 2023. This is because I did not put a date limit when searching, and did not want to re-screen articles that Guy had screened. It could have been optimised using the dplyr function setdiff, but I realized it later. Articles with no doi are put aside as it is more difficult to compare them.  
+
+```{r}
+library(tidyverse)
+```
+
+```{r, results=FALSE}
+#Setting directories and seed
+set.seed(42)
+```
+
+```{r}
+#Setting directories and seed
+set.seed(42)
+#Getting the data 
+wos_guy <- read_csv("Guys_data/effort_Guy_wos.csv")
+wos_mine <- read_csv("Extraction_24_04/WOS_24_04.csv")
+scopus_guy <- read_csv("Guys_data/effort_Guy_scopus.csv")
+scopus_mine <- read_csv("Extraction_24_04/Scopus_24_04.csv")
+cox_guy <- read_csv("Guys_data/effort_Guy_cox_review_cited.csv")
+cox_guy_ref <- read_csv("Guys_data/effort_Guy_cox_review_refs.csv")
+nagy_guy_ref <- read_csv("Guys_data/effort_Guy_nagy_review_refs.csv")
+cox_mine <- read_csv("Extraction_28_04/Cox_cited_28_04_scopus.csv")
+nagy_guy <- read_csv("Guys_data/effort_Guy_nagy_review_cited.csv")
+nagy_mine <- read_csv("Extraction_28_04/Nagy_cited_28_04_scopus.csv")
+cox_mine_bis <- read_csv("Extraction_28_04/Cox_cited_28_04_wos.csv")
+nagy_mine_bis <- read_csv("Extraction_28_04/Nagy_cited_28_04_wos.csv")
+```
+
+
+```{r}
+# Formatting the data
+# Getting rid of the maybe in guy's because are duplicates 
+# Formatting all DOI the same way 
+
+format_guy <- function(df){
+  df <- df %>%
+    filter(INCLUDE != "maybe") %>%
+    # Getting rid of false rows
+    drop_na(STUDY_ID) %>%
+    # Prevent problems when binding
+    mutate(VOLUME = as.numeric(VOLUME),
+           LPAGES = as.numeric(LPAGES),
+           UPAGES = as.numeric(UPAGES)) %>%
+    # Formatting DOI
+    mutate(DOI = str_extract(DOI, "10\\.\\d{4,9}/\\S+"))
+}
+
+# Applying the function to all the datasets
+
+wos_guy <- format_guy(wos_guy)
+scopus_guy <- format_guy(scopus_guy)
+cox_guy <- format_guy(cox_guy)
+nagy_guy <- format_guy(nagy_guy)
+cox_guy_ref <- format_guy(cox_guy_ref)
+nagy_guy_ref <- format_guy(nagy_guy_ref)
+
+# This one is slightly different because the data don't have the same columns 
+
+format_mine <- function(df){
+  df <- df %>%
+    mutate(VOLUME = as.numeric(VOLUME),
+           LPAGES = as.numeric(LPAGES),
+           UPAGES = as.numeric(UPAGES)) %>%
+    mutate(DOI = str_extract(DOI, "10\\.\\d{4,9}/\\S+"))
+}
+
+# Applying to all
+
+wos_mine <- format_mine(wos_mine)
+scopus_mine <- format_mine(scopus_mine)
+cox_mine <- format_mine(cox_mine)
+nagy_mine <- format_mine(nagy_mine)
+cox_mine_bis <- format_mine(cox_mine_bis)
+nagy_mine_bis <- format_mine(nagy_mine_bis)
+
+# Creating bigger datasets 
+
+all_guy <- bind_rows(scopus_guy, wos_guy, nagy_guy, nagy_guy_ref, cox_guy, cox_guy_ref)
+
+all_mine <- bind_rows(scopus_mine, wos_mine, nagy_mine, nagy_mine_bis, cox_mine, cox_mine_bis, cox_guy_ref, nagy_guy_ref)
+
+# Putting missing DOIs aside
+no_doi_mine <- all_mine %>%
+  filter(is.na(DOI))
+
+compare_no_doi <-  anti_join(no_doi_mine %>% select(TITLE), all_guy %>% select(TITLE), by = "TITLE")
+
+no_doi_full <- all_mine %>%
+  filter(TITLE %in% compare_no_doi$TITLE) 
+  
+write_csv(no_doi_full, "missing_doi.csv")
+
+# Saving all data
+all_all <- bind_rows(all_guy, all_mine)
+
+write_csv(all_all, "everything_extracted.csv")
+```
+
+```{r}
+# Creating a function that return the articles that are not in common between two datasets 
+
+compare <- function(df1, df2){
+
+  # Step 1: Find Titles not in common
+  only1 <- anti_join(df1 %>% select(TITLE), df2 %>% select(TITLE), by = "TITLE")
+  only2 <- anti_join(df2 %>% select(TITLE), df1 %>% select(TITLE), by = "TITLE")
+  
+  # Get the unmatched titles that don't have a DOI
+
+  only1_wt_doi <- df1 %>%
+    filter(TITLE %in% only1$TITLE) %>%
+    filter(is.na(DOI))
+  
+  only2_wt_doi <- df2 %>%
+    filter(TITLE %in% only2$TITLE) %>%
+    filter(is.na(DOI))
+  
+  # Step 2: Now check DOI differences, among the unmatched Titles
+  only11 <- df1 %>%
+    filter(TITLE %in% only1$TITLE) %>%
+    select(DOI) %>%
+    anti_join(df2 %>% select(DOI), by = "DOI")
+  
+  only22 <- df2 %>%
+    filter(TITLE %in% only2$TITLE) %>%
+    select(DOI) %>%
+    anti_join(df1 %>% select(DOI), by = "DOI")
+  
+  # Step 3: Retrieve full rows and tag
+  only1_full <- df1 %>%
+    filter(DOI %in% only11$DOI) %>%
+    bind_rows(only1_wt_doi) %>%
+    mutate(SOURCE = "df1")
+  
+  only2_full <- df2 %>%
+    filter(DOI %in% only22$DOI) %>%
+    bind_rows(only2_wt_doi) %>%
+    mutate(SOURCE = "df2")
+  
+  # Step 4: Combine
+  diff <- bind_rows(only1_full, only2_full)
+  
+  return(diff)
+  
+}
+
+```
+
+```{r}
+# Using the function
+all_diff <- compare(all_mine, all_guy) 
+```
+
+```{r}
+# Writing the result in a csv 
+#Separating according to time 
+recent <- c(2023, 2024, 2025)
+
+all_diff_old <- all_diff %>%
+  select(-INCLUDE, -REVIEWERS, -STUDY_ID, -SOURCE) %>%
+  filter(!YEAR %in% recent) 
+
+
+all_dif_recent <- all_diff %>%
+  select(-INCLUDE, -REVIEWERS, -STUDY_ID, -SOURCE) %>%
+  filter(YEAR %in% recent) 
+
+
+write_csv(all_diff_old, "extraction_28_04.csv")
+write_csv(all_diff_recent, "extraction_28_04_old.csv")
+```
+
+
+
+
+
+

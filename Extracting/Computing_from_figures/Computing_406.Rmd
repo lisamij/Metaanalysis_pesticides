@@ -1,0 +1,100 @@
+---
+title: "Computing_406"
+author: "Lisa Mijares"
+date: "2025-06-12"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(drc)
+```
+
+```{r}
+setwd("C:/Users/lisam/OneDrive - University College London/Documents/Project/4_Full_text")
+set.seed(42)
+```
+
+```{r}
+# Getting the data 
+raw_data <- read_csv("Articles/406_formatted.csv")
+
+# Separating into smaller datasets
+
+gly_4 <- raw_data %>%
+  filter(Treatment == "Glyphosate_4")
+
+gly_20 <- raw_data %>%
+  filter(Treatment == "Glyphosate_20")
+
+rd_4 <- raw_data %>%
+  filter(Treatment == "Roundup_4")
+
+rd_20 <- raw_data %>%
+  filter(Treatment == "Roundup_20")
+
+foz_4 <- raw_data %>%
+  filter(Treatment == "Fozat_4")
+
+foz_20 <- raw_data %>%
+  filter(Treatment == "Fozat_20")
+
+gyf_4<- raw_data %>%
+  filter(Treatment == "Glyfos_4")
+
+gyf_20 <- raw_data %>%
+  filter(Treatment == "Glyfos_20")
+
+
+```
+
+```{r}
+
+mod_gly_4 <- drm(Response ~ Dose, data = gly_4, fct = LL.3())
+plot(mod_gly_4)
+
+ED(mod_gly_4, 50)
+
+# Not converging so muted  
+#mod_gly_20 <- drm(Response ~ Dose, data = gly_20, fct = LL.3())
+#plot(mod_gly_20)
+
+#ED(mod_gly_20, 50)
+
+```
+
+```{r}
+mod_rd_4 <- drm(Response ~ Dose, data = rd_4, fct = LL.4())
+plot(mod_rd_4)
+
+ED(mod_rd_4, 50)
+
+mod_rd_20 <- drm(Response ~ Dose, data = rd_20, fct = LL.4())
+plot(mod_rd_20)
+
+ED(mod_rd_20, 50)
+```
+
+```{r}
+mod_foz_4 <- drm(Response ~ Dose, data = foz_4, fct = LL.4())
+plot(mod_foz_4)
+
+ED(mod_foz_4, 50)
+
+mod_foz_20 <- drm(Response ~ Dose, data = foz_20, fct = LL.4())
+plot(mod_foz_20)
+
+ED(mod_foz_20, 50)
+```
+```{r}
+mod_gyf_4 <- drm(Response ~ Dose, data = gyf_4, fct = LL.4())
+plot(mod_gyf_4)
+
+ED(mod_gyf_4, 50)
+
+mod_gyf_20 <- drm(Response ~ Dose, data = gyf_20, fct = LL.4())
+plot(mod_gyf_20)
+
+ED(mod_gyf_20, 50)
+```
+

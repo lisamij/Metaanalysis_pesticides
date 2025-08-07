@@ -1,0 +1,96 @@
+---
+title: "Computing_TDD"
+author: "Lisa Mijares"
+date: "2025-06-10"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(drc)
+```
+
+```{r}
+setwd("C:/Users/lisam/OneDrive - University College London/Documents/Project/4_Full_text")
+set.seed(42)
+```
+```{r}
+# Getting the data 
+raw_data <- read_csv("Articles/243_formatted.csv")
+
+# Transforming the upper and lower bound into a CE, by getting the mean of the upper and lower
+
+data <- raw_data %>%
+  mutate(SE = ((Response_mean - Response_SE_low) + (Response_SE_up - Response_mean))/2) %>%
+  # Modyifing so no SE = 0 
+  mutate(SE = ifelse(SE == 0, SE + 0.05, SE)) %>%
+  mutate(Weight = (1/(SE^2)))
+```
+
+
+```{r}
+# Creating datasets for each treatment and modelling 
+
+single_data <- function(df, treatment){
+  df_mod <- df %>%
+    filter(Treatment == treatment)
+  
+  ref <- df_mod %>%
+    filter(Dose == 0) %>%
+    pull(Response_mean)
+  
+  df_mod <- df_mod %>%
+    mutate(Response_percent = (Response_mean/ref)*100)
+  
+  mod <- drm(Response_percent ~ Dose, data = df_mod, fct = LL.3())
+  plot(mod)
+  
+  result <- ED(mod, respLev = c(50))
+  
+  return(result)
+}
+
+
+
+```
+
+
+```{r}
+prop_24 <- single_data(data, "Propiconazole_24")
+prop_48 <- single_data(data, "Propiconazole_48")
+
+```
+
+
+```{r}
+ment_24 <- single_data(data, "Mentor_24")
+ment_48 <- single_data(data, "Mentor_48")
+```
+
+
+```{r}
+propi_24 <- single_data(data, "PropiStar_24")
+propi_48 <- single_data(data, "PropiStar_48")
+```
+
+
+```{r}
+metco_24 <- single_data(data, "Metconazole_24")
+metco_48 <- single_data(data, "Metconazole_48")
+```
+
+
+```{r}
+quas_24 <- single_data(data, "Quash_24")
+quas_48 <- single_data(data, "Quash_48")
+```
+
+
+```{r}
+cara_24 <- single_data(data, "Caramba_24")
+cara_48 <- single_data(data, "Caramba_48")
+```
+
+
+
+

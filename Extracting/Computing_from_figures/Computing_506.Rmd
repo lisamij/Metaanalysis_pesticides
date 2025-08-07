@@ -1,0 +1,73 @@
+---
+title: "Computing_506"
+author: "Lisa Mijares"
+date: "2025-06-10"
+output: html_document
+---
+```{r}
+library(tidyverse)
+library(drc)
+```
+
+```{r}
+setwd("C:/Users/lisam/OneDrive - University College London/Documents/Project/4_Full_text")
+set.seed(42)
+```
+
+```{r}
+# Getting the data 
+raw_data <- read_csv("Articles/506.csv")
+
+# Separating into severak datasets 
+
+tebpro <- raw_data %>%
+  filter(Treatment == "Mix_ai_teb_pro")%>%
+  drop_na(Response)
+
+prod1 <- raw_data %>%
+  filter(Treatment == "Product_teb_pro")%>%
+  drop_na(Response)
+
+pipcyp <- raw_data %>%
+  filter(Treatment == "Mix_ai_pip_cyp")%>%
+  drop_na(Response)
+
+prod2 <- raw_data %>%
+  filter(Treatment == "Product_pip_cyp")%>%
+  drop_na(Response)
+
+```
+
+```{r}
+# Fitting models 
+
+mod_tebpro <- drm(Response ~ Dose, data = tebpro, fct = LL.4())
+plot(mod_tebpro)
+
+ED(mod_tebpro, 50)
+
+mod_prod1 <- drm(Response ~ Dose, data = prod1, fct = LL.4())
+plot(mod_prod1)
+
+ED(mod_prod1, 50)
+```
+
+
+```{r}
+# Fitting models 
+
+mod_pipcyp <- drm(Response ~ Dose, data = pipcyp, fct = LL.4())
+plot(mod_pipcyp)
+
+ED(mod_pipcyp, 50)
+```
+
+
+```{r}
+mod_prod2 <- drm(Response ~ Dose, data = prod2, fct = LL.4())
+plot(mod_prod2)
+
+ED(mod_prod2, 50)
+```
+
+

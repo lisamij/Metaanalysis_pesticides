@@ -1,0 +1,76 @@
+---
+title: "Screening_maybe"
+author: "Lisa Mijares"
+date: "2025-05-06"
+output: html_document
+---
+
+This is a re-screening of the articles that I categorised as maybe the first time. 
+
+```{r}
+library(tidyverse)
+library(metafor)
+library(metagear)
+```
+
+```{r}
+set.seed(42)
+```
+
+# Going through the maybes 
+
+```{r}
+first <- read_csv("effort_Lisa_finished.csv") %>%
+  drop_na(STUDY_ID)
+
+maybes <- first %>%
+  filter(INCLUDE == "maybe")
+
+```
+```{r}
+effort_distribute(maybes, 
+                  reviewers = "Lisa",
+                  initialize = TRUE,
+                  save_split = TRUE)
+```
+
+```{r}
+abstract_screener("effort_Lisa.csv",
+                  "Lisa",
+                  highlightKeywords = c("toxic", "effect", "mortal", "viab", "endpoint", "end point", "oxid",
+                                        "cell cycle", "dna damage", "apop", "necro", "sensitiv", "growth", "surviv",
+                                        "aberra", "health", "fitness", "output", "reproduct", "develop", "behaviour",
+                                        "behavior", "fecundity", "offspring", "pesticid", "herbicid", "insecticid",
+                                        "fungicid", "acaricid", "miticid", "nematicid", "molluscicid", "rodenticid",
+                                        "agrochem", "active ingredient", "active substance", "active principle",
+                                        "active component", "active constituent", "active pesticide", "active agent",
+                                        "active compound", "pure ingredient", " pure substance", "pure principle",
+                                        "pure component", "pure constituent", "pure pesticide", "pure agent",
+                                        "pure compound", "technical ingredient", "technical substance",
+                                        "technical principle", "technical component", "technical constituent",
+                                        "technical pesticide", "technical agent", "technical compound",
+                                        "technical grade", "fundamental substance", "co formulant", "formulation",
+                                        "formulant", "formulated", "commercial form", "commercial product",
+                                        "commercial mixture", "inactive ingredient", "inert ingredient",
+                                        "adjuvant", "safener", "additive", "surfactant", "technical formulation",
+                                        "technical mixture"))
+```
+
+```{r}
+# re-combining with the maybes 
+maybes_decided <- read_csv("effort_Lisa_maybes_finished.csv") %>%
+  select(-INCLUDE.1, -REVIEWERS.1, -STUDY_ID.2, -STUDY_ID) %>%
+  rename(STUDY_ID = STUDY_ID.1)
+  
+
+all_screened <- first %>%
+  filter(INCLUDE != "maybe") %>%
+  bind_rows(maybes_decided) %>%
+  # Formatting so everybody has a DOI under the same format 
+  mutate(DOI = str_extract(DOI, "10\\.\\d{4,9}/\\S+"))
+
+write_csv(all_screened, "All_screened_Lisa_08_05.csv")
+  
+```
+
+

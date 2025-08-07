@@ -1,0 +1,68 @@
+---
+title: "Screening"
+author: "Lisa Mijares"
+date: "2025-04-29"
+output: html_document
+---
+
+This markdown allow to abstract-title screen articles, using the metagear package. The effort_distribute will create a file, that is then completed by the abstract screener function. when it was finished, I renamed the file effort_X_finished, and used that to create the _included files. 
+
+```{r}
+library(tidyverse)
+library(metafor)
+library(metagear)
+```
+```{r}
+set.seed(42)
+```
+
+```{r}
+# Getting the data 
+# Change the name of the file for the one you want to screen
+studies <- read_csv("missing_doi.csv")
+```
+
+```{r}
+effort_distribute(studies, 
+                  reviewers = "Lisa",
+                  initialize = TRUE,
+                  save_split = TRUE)
+```
+
+```{r, eval=FALSE}
+abstract_screener("effort_Lisa.csv",
+                  "Lisa",
+                  highlightKeywords = c("toxic", "effect", "mortal", "viab", "endpoint", "end point", "oxid",
+                                        "cell cycle", "dna damage", "apop", "necro", "sensitiv", "growth", "surviv",
+                                        "aberra", "health", "fitness", "output", "reproduct", "develop", "behaviour",
+                                        "behavior", "fecundity", "offspring", "pesticid", "herbicid", "insecticid",
+                                        "fungicid", "acaricid", "miticid", "nematicid", "molluscicid", "rodenticid",
+                                        "agrochem", "active ingredient", "active substance", "active principle",
+                                        "active component", "active constituent", "active pesticide", "active agent",
+                                        "active compound", "pure ingredient", " pure substance", "pure principle",
+                                        "pure component", "pure constituent", "pure pesticide", "pure agent",
+                                        "pure compound", "technical ingredient", "technical substance",
+                                        "technical principle", "technical component", "technical constituent",
+                                        "technical pesticide", "technical agent", "technical compound",
+                                        "technical grade", "fundamental substance", "co formulant", "formulation",
+                                        "formulant", "formulated", "commercial form", "commercial product",
+                                        "commercial mixture", "inactive ingredient", "inert ingredient",
+                                        "adjuvant", "safener", "additive", "surfactant", "technical formulation",
+                                        "technical mixture"))
+```
+
+
+
+```{r}
+no_doi <- read_csv("effort_Lisa_no_doi_finished.csv")
+
+# Filtering to keep the interesting ones
+no_doi_yes <- no_doi %>%
+  filter(INCLUDE == "YES") %>%
+  distinct(DOI, .keep_all = TRUE)
+
+write_csv(no_doi_yes, "no_doi_included.csv")
+```
+
+
+

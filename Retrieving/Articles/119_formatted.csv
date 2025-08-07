@@ -1,0 +1,31 @@
+﻿Dose,Treatment,Response_mean,Response_mean_SE
+0,Glyphosate ,7.077,10.769
+0.01,Glyphosate ,4.615,8
+0.1,Glyphosate ,7.077,13.231
+1,Glyphosate ,2.769,5.538
+10,Glyphosate ,4.615,8.615
+100,Glyphosate ,4,8
+0,Glyphosate_TF,9.091,17.172
+0.01,Glyphosate_TF,8.418,12.458
+0.1,Glyphosate_TF,18.855,31.987
+1,Glyphosate_TF,6.397,11.448
+10,Glyphosate_TF,8.754,14.815
+100,Glyphosate_TF,8.754,15.152
+0,Durano,11.62,18.31
+0.01,Durano,9.859,16.549
+0.1,Durano,17.606,33.451
+1,Durano,9.155,14.437
+10,Durano,10.211,13.38
+100,Durano,99.648,99.648
+0,Helosate ,8.711,14.286
+0.01,Helosate ,6.969,11.498
+0.1,Helosate ,11.498,19.861
+1,Helosate ,4.181,8.014
+10,Helosate ,3.136,6.272
+100,Helosate ,99.303,99.303
+0,Kyleo,14.894,21.631
+0.01,Kyleo,6.028,8.511
+0.1,Kyleo,19.149,32.27
+1,Kyleo,9.929,14.184
+10,Kyleo,96.099,100
+100,Kyleo,99.291,99.291

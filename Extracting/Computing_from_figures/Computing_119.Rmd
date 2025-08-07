@@ -1,0 +1,89 @@
+---
+title: "Computing_119"
+author: "Lisa Mijares"
+date: "2025-06-11"
+output: html_document
+---
+
+
+```{r}
+library(tidyverse)
+library(drc)
+```
+
+
+```{r}
+setwd("C:/Users/lisam/OneDrive - University College London/Documents/Project/4_Full_text")
+set.seed(42)
+```
+
+```{r}
+# Getting the data 
+raw_data <- read_csv("Articles/119_formatted.csv")
+
+data <- raw_data %>%
+  mutate(SE = (Response_mean_SE - Response_mean)) %>%
+  # Modyifing so no SE = 0 
+  mutate(SE = ifelse(SE == 0, SE + 0.05, SE)) %>%
+  mutate(Weight = (1/(SE^2)))
+```
+
+
+```{r}
+# Separating into smaller datasets
+
+gly <- data %>%
+  filter(Treatment == "Glyphosate")
+
+gly_tf <- data %>%
+  filter(Treatment == "Glyphosate_TF")
+
+dur <- data %>%
+  filter(Treatment == "Durano")
+
+hel <- data %>%
+  filter(Treatment == "Helosate")
+
+kyl <- data %>%
+  filter(Treatment == "Kyleo")
+```
+
+
+```{r}
+
+mod_gly <- drm(Response_mean ~ Dose, data = gly, fct = LL.4())
+plot(mod_gly)
+
+ED(mod_gly, 50)
+```
+
+```{r}
+
+mod_glytf <- drm(Response_mean ~ Dose, data = gly_tf, fct = LL.3())
+plot(mod_glytf)
+
+ED(mod_glytf, 50)
+```
+
+```{r}
+mod_dur <- drm(Response_mean ~ Dose, data = dur, fct = LL.4())
+plot(mod_dur)
+
+ED(mod_dur, 50)
+```
+
+```{r}
+
+mod_hel <- drm(Response_mean ~ Dose, data = hel, fct = LL.4())
+plot(mod_hel)
+
+ED(mod_hel, 50)
+```
+
+```{r}
+
+mod_kyl <- drm(Response_mean ~ Dose, data = kyl, fct = LL.4())
+plot(mod_kyl)
+
+ED(mod_kyl, 50)
+```

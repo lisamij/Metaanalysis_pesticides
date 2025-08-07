@@ -8,7 +8,7 @@ I also abstract-title screened 100 papers from Guy's extraction to determine an 
 
 **2 - Screening**
 In this section, I abstract-title screened the results of the comparison of my search with Guy's.
-There is a second file to screen the articles I labelled as maybe during the first screen.
+There is a second markdown to screen the articles I labelled as maybe during the first screen.
 
 **3 - Retrieving**
 There is no code for this part, it is just mostly files. 
@@ -24,8 +24,8 @@ The extraction format that I used was not optimal and was modified later.
 The folder Computing_from_figures contained the extraction from WebPlotDigitalizer and markdowns for the fitting of the dose-response curves. 
 
 **5 - Analysis**
-This is the proper meta-analysis. The file Analysis_final.rmd is the one used to produce the final results and figures for my dissertation so it is influenced by some decisions. 
-The file Analysis.rmd is the older version, where almost all the dataset is used. Analysis_EFSA.rmd is the analysis of the EFSA dataset.
+This is the proper meta-analysis. The markdown Analysis_final.rmd is the one used to produce the final results and figures for my dissertation so it is influenced by some decisions. 
+The markdown Analysis.rmd is the older version, where almost all the dataset is used. Analysis_EFSA.rmd is the analysis of the EFSA dataset.
 The files from the precedent section were modified following the implementation of the covariance matrix, leading to the "data_extraction_X_formatted" files. 
 Essentially, this modification concerned the columns for the control and test groups, that need to be specified according the formatted documents. 
 

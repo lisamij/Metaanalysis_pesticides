@@ -1,0 +1,521 @@
+---
+title: "Analysis_EFSA"
+author: "Lisa Mijares"
+date: "2025-06-18"
+output: html_document
+---
+
+This markdown is for the analysis of the EFSA data. 
+
+# Set-up 
+
+```{r}
+# Importing packages
+library(tidyverse)
+library(metafor)
+library(metagear)
+library(drc)
+library(metaAidR)
+library(ape)
+library(rotl)
+library(corrplot)
+library(MuMIn)
+library(clubSandwich)
+library(emmeans)
+library(orchaRd)
+library(fitdistrplus)
+library(kableExtra)
+library(cowplot)
+library(webshot2)
+library(patchwork)
+library(ggbeeswarm)
+library(lme4)
+```
+
+```{r}
+#library(remotes)
+#remotes::install_github("daniel1noble/metaAidR")
+#library(devtools)
+#devtools::install_github("daniel1noble/orchaRd", force = TRUE)
+
+```
+
+
+```{r}
+set.seed(42)
+```
+
+```{r}
+# Getting the data 
+efsa_data <- read_csv("Input/data_extraction_EFSA_formatted.csv") 
+```
+
+
+```{r}
+# Separating into sevral datasets according to the level of confidence
+efsa_data_sure <- efsa_data %>%
+  filter(FORMULATION_EXPRESSED_IN_AI_CONC != "UNSURE")
+
+efsa_data_both_supp <- efsa_data_sure %>%
+  filter(str_detect(AI_50, "^\\s*>") & str_detect(FORM_50, "^\\s*>"))
+
+efsa_data_really_sure <- anti_join(efsa_data_sure, efsa_data_both_supp)
+
+efsa_data_one_supp <- efsa_data_really_sure %>%
+  filter(str_detect(AI_50, "^\\s*>") | str_detect(FORM_50, "^\\s*>"))
+
+efsa_data_no_supp <- anti_join(efsa_data_really_sure, efsa_data_one_supp)
+
+```
+
+```{r}
+# This the fixed weight variance
+variance <- 1
+
+
+# Applying the variance and calculating the LRR
+efsa_data_no_supp <- efsa_data_no_supp %>%
+  mutate(AI_50 = as.numeric(AI_50),
+         FORM_50 = as.numeric(FORM_50)) %>%
+  mutate(LRR = log(FORM_50/AI_50),
+         LRR_VAR_FIXED = variance)
+
+efsa_data_formatted <- efsa_data_sure %>%
+  mutate(AI_50 = str_remove(AI_50, ">") %>% as.numeric()) %>%
+  mutate(FORM_50 = str_remove(FORM_50, ">") %>% as.numeric()) %>%
+  mutate(LRR = log(FORM_50/AI_50),
+         LRR_VAR_FIXED = variance)
+  
+
+
+```
+
+Now I separate per species, and filter so that there is more than 5 effect sizes. I've done it by hand but it would be better to do it in a cleaner way. 
+
+```{r}
+# Need more than 5 effect sizes 
+efsa_data_formatted <- efsa_data_formatted %>%
+  filter(PESTICIDE_CLASS %in% c("Herbicide", "Fungicide", "Insecticide", "Plant growth regulator"))
+
+# Separating per species 
+daphnia <- efsa_data_formatted %>%
+  filter(SPECIES_NAME_BINOMIAL == "Daphnia magna")
+
+honeybee <- efsa_data_formatted %>%
+  filter(SPECIES_NAME_BINOMIAL == "Apis mellifera")
+
+honeybee_contact <- honeybee %>%
+  filter(EXPOSURE_ROUTE == "Contact")
+
+honeybee_oral <- honeybee %>%
+  filter(EXPOSURE_ROUTE == "Oral")
+
+earthworm <- efsa_data_formatted %>%
+  filter(SPECIES_NAME_BINOMIAL == "Eisenia foetida" | SPECIES_NAME_COMMON == "Earthworm") %>%
+  filter(!PESTICIDE_CLASS == "Plant growth regulator")
+
+fish <- efsa_data_formatted %>%
+  filter(SPECIES_NAME_BINOMIAL %in% c("Oncorhynchus mykiss", "Lepomis macrochirus"))  %>%
+  filter(!PESTICIDE_CLASS == "Plant growth regulator")
+
+algae <- efsa_data_formatted %>%
+  filter(SPECIES_NAME_BINOMIAL %in% c("Pseudokirchneriella subcapitata", "Selenastrum capricornutum", "Scenedesmus subspicatus", "Navicula pelliculosa", "Desmodesmus subspicatus") | SPECIES_NAME_COMMON == "Green alga")
+  
+bird <- efsa_data_formatted %>%
+  filter(SPECIES_NAME_BINOMIAL %in% c("Colinus virginianus", "Coturnix japonica") | SPECIES_NAME_COMMON %in% c("Mallard duck", "Birds"))%>%
+  filter(!PESTICIDE_CLASS == "Insecticide")
+
+rat <- efsa_data_formatted %>%
+  filter(SPECIES_NAME_COMMON == "Rat") %>%
+  filter(!PESTICIDE_CLASS %in% c("Insecticide","Plant growth regulator"))
+
+
+simple_model_daphnia <- rma(yi = LRR,
+                        vi = LRR_VAR_FIXED,
+                        mods =  ~  0 + PESTICIDE_CLASS,
+                        method = "FE",
+                        data = daphnia)
+
+
+
+orchard_plot(simple_model_daphnia, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999"))
+
+
+
+simple_model_bee <- rma(yi = LRR,
+                        vi = LRR_VAR_FIXED,
+                        mods =  ~  0 + PESTICIDE_CLASS,
+                        method = "FE",
+                        data = honeybee)
+
+
+
+orchard_plot(simple_model_bee, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999"))  
+  
+
+
+
+
+
+simple_model_worm <- rma(yi = LRR,
+                        vi = LRR_VAR_FIXED,
+                        mods =  ~  0 + PESTICIDE_CLASS,
+                        method = "FE",
+                        data = earthworm)
+
+
+
+orchard_plot(simple_model_worm, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999"))
+
+
+
+simple_model_algae<- rma(yi = LRR,
+                        vi = LRR_VAR_FIXED,
+                        mods =  ~  0 + PESTICIDE_CLASS,
+                        method = "FE",
+                        data = algae)
+
+
+
+orchard_plot(simple_model_algae, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999"))
+
+simple_model_fish<- rma(yi = LRR,
+                        vi = LRR_VAR_FIXED,
+                        mods =  ~  0 + PESTICIDE_CLASS,
+                        method = "FE",
+                        data = fish)
+
+
+
+orchard_plot(simple_model_fish, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999"))
+
+
+simple_model_bird<- rma(yi = LRR,
+                        vi = LRR_VAR_FIXED,
+                        mods =  ~  0 + PESTICIDE_CLASS,
+                        method = "FE",
+                        data = bird)
+
+
+
+orchard_plot(simple_model_bird, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999"))
+
+
+simple_model_rat<- rma(yi = LRR,
+                        vi = LRR_VAR_FIXED,
+                        mods =  ~  0 + PESTICIDE_CLASS,
+                        method = "FE",
+                        data = rat)
+
+
+
+orchard_plot(simple_model_rat, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999"))
+```
+
+
+
+
+
+```{r}
+table(efsa_data_sure$SPECIES_NAME_BINOMIAL)
+table(efsa_data_sure$SPECIES_NAME_COMMON)
+```
+
+```{r}
+# Couting how many negative TDD
+count1 <- efsa_data_one_supp %>%
+  filter(str_detect(AI_50, "^\\s*>"))
+
+count2 <- efsa_data_one_supp %>%
+  filter(str_detect(FORM_50, "^\\s*>"))
+
+comp_efsa1 <- efsa_data_formatted %>%
+  mutate(comparison = case_when(
+    AI_50 > FORM_50 ~ "AI_50 > FORM_50",
+    AI_50 < FORM_50 ~ "AI_50 < FORM_50",
+    AI_50 == FORM_50 ~ "AI_50 == FORM_50",
+    TRUE ~ "Missing or incomparable"
+  )) %>%
+  count(comparison)
+
+comp_efssa2 <- efsa_data_really_sure_formatted %>%
+  mutate(comparison = case_when(
+    AI_50 > FORM_50 ~ "AI_50 > FORM_50",
+    AI_50 < FORM_50 ~ "AI_50 < FORM_50",
+    AI_50 == FORM_50 ~ "AI_50 == FORM_50",
+    TRUE ~ "Missing or incomparable"
+  )) %>%
+  count(comparison)
+
+
+```
+
+Now I test several fixed varaince weights
+
+```{r}
+
+variance_list <- c(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1) 
+
+for (i in 1:length(variance_list)){
+  honeybee <- honeybee %>%
+    mutate(LRR_VAR_FIXED = variance_list[i])
+
+simple_model_bee <- rma(yi = LRR,
+                        vi = LRR_VAR_FIXED,
+                        mods =  ~  0 + PESTICIDE_CLASS,
+                        method = "FE",
+                        data = honeybee)
+
+
+
+plot <- orchard_plot(simple_model_bee, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00", "#D55E00", "#0072B2", "#999999"))  
+  
+
+print(plot)
+}
+
+```
+
+```{r}
+ggplot(honeybee, aes(x = LRR))+
+  geom_histogram()
+```
+
+
+```{r}
+# defining a function that get results per species for both methods
+get_efsa_results <- function(data_species, variance_fixed, n_bootstrap) {
+  
+  # Apply fixed variance
+  data_modified <- data_species %>%
+    mutate(LRR_VAR_FIXED = variance_fixed)
+  
+  # Fixed effects model
+  mod <- rma(yi = LRR,
+             vi = LRR_VAR_FIXED,
+             mods = ~ 0 + PESTICIDE_CLASS,
+             method = "FE",
+             data = data_modified)
+  
+  # Extract fixed effect results
+  fixed_df <- data.frame(
+    PESTICIDE_CLASS = gsub("^PESTICIDE_CLASS", "", rownames(mod$beta)),
+    estimate = as.vector(mod$beta),
+    lower = mod$ci.lb,
+    upper = mod$ci.ub
+  ) %>%
+    mutate(model = "Fixed effects") %>%
+    dplyr::select(model, PESTICIDE_CLASS, estimate, lower, upper)
+  
+  # Put into wide format
+  wide_fixed <- fixed_df %>%
+    pivot_wider(names_from = PESTICIDE_CLASS,
+                values_from = c(estimate, lower, upper)) %>%
+    mutate(across(-model, round, digits = 4))
+  
+  # Bootstrap part
+  pesticides <- unique(data_modified$PESTICIDE_CLASS)
+  
+  bootstrap_list <- lapply(pesticides, function(pest) {
+    LRR_vals <- data_modified %>%
+      filter(PESTICIDE_CLASS == pest) %>%
+      pull(LRR)
+    
+    if (length(LRR_vals) < 2) {
+      return(tibble(PESTICIDE_CLASS = pest,
+                    estimate = NA,
+                    lower = NA,
+                    upper = NA))
+    }
+    
+    boot_means <- replicate(n_bootstrap, mean(sample(LRR_vals, replace = TRUE)))
+    ci <- quantile(boot_means, c(0.025, 0.975))
+    
+    tibble(
+      PESTICIDE_CLASS = pest,
+      estimate = mean(boot_means),
+      lower = ci[1],
+      upper = ci[2]
+    )
+  })
+  
+  bootstrap_df <- bind_rows(bootstrap_list) %>%
+    mutate(model = "Bootstrap") %>%
+    dplyr::select(model, everything())
+  
+  # Put into wide format
+  wide_bootstrap <- bootstrap_df %>%
+    pivot_wider(names_from = PESTICIDE_CLASS,
+                values_from = c(estimate, lower, upper)) %>%
+    mutate(across(-model, round, digits = 4))
+  
+  # Combine both methods
+  result <- bind_rows(wide_fixed, wide_bootstrap)
+  
+  # Reorder columns: lower, estimate, upper
+  pesticides <- sub(".*_(.*)", "\\1", grep("^estimate_", names(result), value = TRUE))
+  ordered_cols <- c("model", unlist(lapply(pesticides, function(p) {
+    c(paste0("lower_", p), paste0("estimate_", p), paste0("upper_", p))
+  })))
+  result_ordered <- result[, ordered_cols]
+  
+  return(result_ordered)
+}
+
+
+
+
+
+```
+
+```{r}
+# Getting the results 
+results_honeybee <- get_efsa_results(honeybee, 1, 4999)
+results_earthworm <- get_efsa_results(earthworm, 1, 4999)
+results_fish <- get_efsa_results(fish, 1, 4999)
+results_rat <- get_efsa_results(rat, 1, 4999)
+results_algae <- get_efsa_results(algae, 1, 4999)
+results_daphnia <- get_efsa_results(daphnia, 1, 4999)
+results_birds <- get_efsa_results(bird, 1, 4999)
+```
+
+```{r}
+# Add species name and bind all results together
+all_results <- bind_rows(
+  results_honeybee %>% mutate(Species = "Honeybee"),
+  results_earthworm %>% mutate(Species = "Earthworm"),
+  results_fish %>% mutate(Species = "Fish"),
+  results_rat %>% mutate(Species = "Rat"),
+  results_algae %>% mutate(Species = "Algae"),
+  results_daphnia %>% mutate(Species = "Water flea"),
+  results_birds %>% mutate(Species = "Bird")
+)
+
+# Reshape into long format
+long_results <- all_results %>%
+  pivot_longer(
+    cols = -c(model, Species),
+    names_to = c("metric", "Pesticide"),
+    names_sep = "_",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = "metric",
+    values_from = "value"
+  )
+# Determine significance
+long_results <- long_results %>%
+  mutate(significant = ifelse(lower > 0 | upper < 0, TRUE, FALSE)) %>%
+  mutate(effect_status = case_when(
+    is.na(estimate) ~ "Data deficient",
+    lower > 0 ~ "Significant",
+    upper < 0 ~ "Significant",
+    TRUE ~ "Not significant"
+  ))
+
+# Plot
+ggplot(long_results, aes(x = Pesticide, y = Species)) +
+  geom_tile(aes(fill = ifelse(effect_status == "Significant", estimate, NA_real_)), 
+            color = "white", linewidth = 0.5) +
+  
+  # Manually overlay tiles for non-significant and NA
+  geom_tile(data = subset(long_results, effect_status == "Not significant"),
+            fill = "grey85", color = "white", linewidth = 0.5) +
+  
+  geom_tile(data = subset(long_results, effect_status == "Data deficient"),
+            fill = "white", color = "black", linewidth = 0.5, linetype = "dashed") +
+
+  facet_wrap(~model) +
+  
+  scale_fill_gradient2(
+    name = "lnRR (Significant only)",
+    low = "#F21A00", mid = "white", high = "#3B9AB2",
+    midpoint = 0, na.value = NA
+  ) +
+  
+  labs(
+    title = "Effect Size Intensity by Species and Pesticide Class",
+    x = "Pesticide Class", y = "Species"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+
+```{r}
+# Another plot
+long_results <- long_results %>%
+  mutate(effect_status = case_when(
+    is.na(estimate) ~ "Data deficient",
+    lower > 0 ~ "Positive",
+    upper < 0 ~ "Negative",
+    TRUE ~ "Not significant"
+  ))
+
+ggplot(long_results, aes(x = Pesticide, y = Species, fill = effect_status)) +
+  geom_tile(color = "grey30", linewidth = 0.5, alpha = 0.8) +
+  facet_wrap(~model) +
+  scale_fill_manual(
+    values = c(
+    "Positive" = "#66C2A5",       # Soft green-teal (ColorBrewer palette)
+    "Negative" = "#FC8D62",       # Warm coral/orange-red
+    "Not significant" = "lightgoldenrod1",# Bright yellow (high visibility)
+    "Data deficient" = "#D3D3D3")  # Light grey for NA
+  ) +
+  labs(
+    fill = "Effect",
+    x = "Pesticide Class",
+    y = "Species"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+```
+

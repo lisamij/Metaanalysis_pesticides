@@ -1,0 +1,3277 @@
+---
+title: "Analysis"
+author: "Lisa Mijares"
+date: "2025-06-18"
+output: html_document
+---
+
+This is a modification from Guy's markdown called meta_analysis_ordered_combined. This is not the final version for my dissertation so there may be some inconsistencies. 
+
+# Set-up 
+
+```{r}
+# Importing packages
+library(tidyverse)
+library(metafor)
+library(metagear)
+library(drc)
+library(metaAidR)
+library(ape)
+library(rotl)
+library(corrplot)
+library(MuMIn)
+library(clubSandwich)
+library(emmeans)
+library(orchaRd)
+library(fitdistrplus)
+library(kableExtra)
+library(cowplot)
+library(webshot2)
+library(patchwork)
+library(ggbeeswarm)
+```
+
+```{r}
+#library(remotes)
+#remotes::install_github("daniel1noble/metaAidR")
+#library(devtools)
+#devtools::install_github("daniel1noble/orchaRd", force = TRUE)
+
+```
+
+
+```{r}
+set.seed(42)
+```
+
+# Preparing the data 
+
+I did some changes on Guy's file directly in Excel : add two columns, bio formulation and guidelines, and replace n/a by NA so R can directly understand in tidyverse
+
+Note: Compared to Guy's script I don't need to convert the columns to numeric thanks to the changes mentionned 
+
+```{r}
+# Getting the data 
+guy_data <- read_csv("Input/data_extraction_Guy_2x5.csv") %>%
+  mutate(SOURCE= "Guy")
+lisa_data <- read_csv("Input/effect_size_included_23_06.csv") %>%
+  mutate(SOURCE = "Lisa") %>%
+  mutate(STUDY_ID = as.character(STUDY_ID)) %>% # because Guy has letters in his study ids  
+  mutate(PH = as.character(PH)) %>% # because Guy has comments in the PH column
+# Changing the data id in my dataset so there's no duplicates
+  mutate(DATA_ID = DATA_ID + 466)
+
+#Joining the data
+
+all_data <- bind_rows(guy_data, lisa_data)
+```
+
+Note: I have a paper that report SD, which was not the case in Guy's dataset. But for the AI they report SD = O so it is excluded for now 
+
+```{r}
+# Cleaning and separating into smaller datasets 
+
+all_data_formatted <- all_data %>%
+  # Remove the > signs from the values 
+  mutate(AI_50 = str_remove(AI_50, ">") %>% as.numeric()) %>%
+  mutate(FORM_50 = str_remove(FORM_50, ">") %>% as.numeric()) %>%
+  mutate(FORMULATION_TYPE = FORMULATION_TYPE %>%
+             str_remove("s$") %>%   # Remove trailing 's'
+             str_to_lower()) %>%
+  mutate(PESTICIDE_CLASS = str_to_lower(PESTICIDE_CLASS)) %>%
+  mutate(EXPOSURE_ROUTE = str_to_lower(EXPOSURE_ROUTE)) %>%
+  mutate(AI_NAME = str_to_lower(AI_NAME))
+
+# Separating between rows with error and missing error 
+data_no_missing <- all_data_formatted %>%
+  drop_na(FORM_ERROR_TYPE) %>%
+  drop_na(AI_ERROR_TYPE)
+
+data_missing_error <- all_data_formatted %>%
+  filter(is.na(AI_ERROR_TYPE) | is.na(FORM_ERROR_TYPE))
+
+# Could also have use the variable SE_SIMULATION_REQUIRED 
+
+# Excluding some rows
+
+data_cleaned <- data_no_missing %>%
+  # Excluding of not same error type 
+  filter(AI_ERROR_TYPE == FORM_ERROR_TYPE) %>%
+  # Excluding if both arms are <0
+  filter((AI_ERROR_HIGHER > 0 | AI_ERROR_LOWER > 0) &
+         (FORM_ERROR_LOWER > 0 | FORM_ERROR_HIGHER > 0))
+
+# Keeping traces of excluded rows 
+excluded <- data_no_missing %>%
+  filter(AI_ERROR_TYPE != FORM_ERROR_TYPE) %>%
+  mutate(REASON_EXCLUSION = "Not_same_error_type") %>% 
+  bind_rows(data_no_missing %>%  
+              filter((AI_ERROR_LOWER <= 0 & AI_ERROR_HIGHER <= 0) |
+                       (FORM_ERROR_LOWER <= 0 & FORM_ERROR_HIGHER <= 0)) %>%
+              mutate(REASON_EXCLUSION = "Both_error_negative_or_null"))
+    
+# Separating according to the tyoe of error 
+
+# Creating a df with rows where the error is a CI
+data_CI <- data_cleaned %>%
+  filter(AI_ERROR_TYPE == "CI_95")
+
+# Creating a df with rows where the error is a SE
+data_SE <- data_cleaned %>%
+  filter(AI_ERROR_TYPE == "SE")
+
+# Creating a df with rows where the error is a SD
+data_SD <- data_cleaned %>%
+  filter(AI_ERROR_TYPE == "SD")
+
+```
+
+Check: Until here, same results as Guy on his dataset, note that he has two empty rows in ci_95_rows and se_rows I don't understand why. 
+
+```{r}
+# Some checks 
+nrow(data_no_missing) + nrow(data_missing_error) == nrow(all_data_formatted)
+nrow(excluded) + nrow(data_cleaned) == nrow(data_no_missing)
+nrow(data_CI) + nrow(data_SD) + nrow(data_SE) == nrow(data_cleaned)
+```
+
+
+# Focus on the data with no error 
+
+Determining how many of these effect sizes:
+
+1) AI > the FORM
+2) FORM > AI
+3) AI = FORM
+```{r}
+# Excluding rows if negative or null error
+# Strange way of doing due to the NA handling 
+
+to_exclude <- data_missing_error %>%
+  filter((AI_ERROR_LOWER <= 0 & AI_ERROR_HIGHER <= 0) |
+          (FORM_ERROR_LOWER <= 0 & FORM_ERROR_HIGHER <= 0))
+
+data_missing_cleaned <- anti_join(data_missing_error, to_exclude)
+
+excluded <- excluded %>%
+  bind_rows(to_exclude %>% mutate(REASON_EXCLUSION = "Both_Error_negative_or_null"))
+
+# Removing two effect sizes, according to Guy: where CI was not generated in primary source due to reliability
+
+data_missing_cleaned <- data_missing_cleaned %>%
+  filter(!(DATA_ID %in% c(111, 370)))
+
+excluded <- excluded %>%
+  bind_rows(data_missing_error %>% filter(DATA_ID %in% c(111, 370)) %>%
+              mutate(REASON_EXCLUSION = "CI_not_reliable_primary_source_seeGuy"))
+
+# Counting the rows in each category 
+
+comparison_summary <- data_missing_cleaned %>%
+  mutate(comparison = case_when(
+    AI_50 > FORM_50 ~ "AI_50 > FORM_50",
+    AI_50 < FORM_50 ~ "AI_50 < FORM_50",
+    AI_50 == FORM_50 ~ "AI_50 == FORM_50",
+    TRUE ~ "Missing or incomparable"
+  )) %>%
+  count(comparison)
+```
+
+```{r}
+# Some checks 
+nrow(data_missing_cleaned) + nrow(to_exclude) + 2 == nrow(data_missing_error)
+```
+
+Check: Same results than Guy until here. Comparing with results from the Methods, not from the script because it's not the same 
+
+Results of the count: 
+Of the 121 effect sizes with missing SE values:
+
+1) For 91 the AI has a higher ED50 than the FORM.
+2) For 11 the FORM has a higher ED50 than the AI.
+3) For 19 the AI and FORM have the same ED50.
+
+So for the dataset with missing variance values, 75% of effect sizes had an AI with a bigger ED50 than their formulation.
+
+What is the pattern for the dataset where variance values exist?
+
+```{r}
+comparison_summary2 <- data_cleaned %>%
+  mutate(comparison = case_when(
+    AI_50 > FORM_50 ~ "AI_50 > FORM_50",
+    AI_50 < FORM_50 ~ "AI_50 < FORM_50",
+    AI_50 == FORM_50 ~ "AI_50 == FORM_50",
+    TRUE ~ "Missing or incomparable"
+  )) %>%
+  count(comparison)
+```
+
+Of the 448 effect sizes with no missing SE values:
+
+1) For 286 the AI has a higher ED50 than the FORM.
+2) For 11 the FORM has a higher ED50 than the AI.
+3) For 153 the AI and FORM have the same ED50.
+
+So for the dataset with variance values, 63.8% of effect sizes had an AI with a bigger ED50 than their formulation.
+
+*This shows that the data with "missing" SE values has a greater proportion of effect sizes with less toxic AIs in comparison to the data with a variance estimate. *
+
+*Of course, these SEs aren't really "missing". They never existed as for these observations point estimates couldn't be calculated because the AI/FORM was non-toxic over the tested range. I only want to estimate them to include the effect sizes as these observations contain information on the direction and magnitude of the overall effect estimate.*
+
+*Including effect sizes with imputed data is also conservative in a way because I am logging the ED50 as the > value. So the difference between the AI and FORM is actually greater than the effect size recorded. As the bulk of the imputed data is AI ED50 > FORM ED50, then the bulk of the effect estimates are underestimating the effect of the formulation.*
+
+--------------------------
+
+*SE = CI_95 / x. x is determined by a t-distribution value, which in turn is determined by sample size (and significance level). A smaller sample size results in a larger t-distribution value, which in turn results in a smaller extracted SE.*
+
+*When the primary sources ran their analysis I don't know whether they used the individual level sample size, the container level sample size or an effective sample size somewhere between the two. The sample size I select has an effect on the SE extracted, and in turn the LRR variance.*
+
+*Although the LRR variance for the INDIVIDUAL_LEVEL sample size will have the biggest values (biggest sample size, biggest extracted SE) compared to the other assumed sample sizes, their size will change in relation to the other effect sizes. Look at the example below.*
+
+*INDIVIDUAL_LEVEL sample size:*
+
+*10, 30, 40, 3, 7*
+
+*CONTAINER_LEVEL sample size (INDIVIDUALS_PER_CONTAINER):*
+
+*10(1), 3(10), 4(10), 3(1), 7(1)*
+
+*Using INDIVIDUAL_LEVEL sample size the directional effect of the t-distribution values on the extracted SE will be:*
+
+*medium, big, big, small, medium*
+
+*Using CONTAINER_LEVEL sample size the directional effect of the t-distribution values on the extracted SE will be:*
+
+*big, small, small, small, medium*
+
+*At this stage I decided to use the INDIVIDUAL_LEVEL sample size, which I think is the most likely n most researchers would have used. Right at the end of my analysis I will re-run my final model using the LRR variance values extracted using CONTAINER_LEVEL n and two effective sample sizes based on two ICC values, extracted from studies included within the meta-analysis.*
+
+Problem: For bacteria the concept of individual and container sample size is not applicable. In this case INDIVIDUAL PER CONTAINER should be 1 
+
+
+
+```{r}
+
+data_CI <- data_CI %>%
+  # Creating columns to select the biggest of two CI arms and the individual sample size
+  mutate(AI_BIGGEST_CI_ARM = pmax(AI_ERROR_HIGHER, AI_ERROR_LOWER))%>%
+  mutate(FORM_BIGGEST_CI_ARM = pmax(FORM_ERROR_HIGHER, FORM_ERROR_LOWER)) %>%
+  mutate(AI_N_INDIVIDUAL = AI_N_CONTAINER * AI_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(FORM_N_INDIVIDUAL = FORM_N_CONTAINER * FORM_N_INDIVIDUALS_PER_CONTAINER) %>%
+  # Calculating the SE from t statistic and sample size
+  mutate(AI_SE_INDIVIDUAL = AI_BIGGEST_CI_ARM/(-qt(0.025, df = AI_N_INDIVIDUAL - 1))) %>%
+  mutate(FORM_SE_INDIVIDUAL = FORM_BIGGEST_CI_ARM/(-qt(0.025, df = FORM_N_INDIVIDUAL - 1)))
+  
+```
+
+CHECK: Same results, using anti_join(data_CI, ci_95_rows), all the different rows are from my dataset. To do this check need to have run Guy's markdown in parallel.
+
+Now I will do the same process in the case of SD, even if for now my SD rows have been excluded
+
+```{r}
+data_SD <- data_SD %>%
+  # Creating columns for individual sample size
+  mutate(AI_N_INDIVIDUAL = AI_N_CONTAINER * AI_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(FORM_N_INDIVIDUAL = FORM_N_CONTAINER * FORM_N_INDIVIDUALS_PER_CONTAINER) %>%
+  # Calculating the SE from sample size
+  mutate(AI_SE_INDIVIDUAL = AI_ERROR_LOWER/sqrt(AI_N_INDIVIDUAL)) %>%
+  mutate(FORM_SE_INDIVIDUAL = FORM_ERROR_LOWER/sqrt(FORM_N_INDIVIDUAL))
+```
+
+
+*Now that the CI and SD rows have been converted to SE, we can combine everything together*
+```{r}
+data_SE <- data_SE %>%
+  # Adding the same columns than the other dataframes
+  mutate(AI_N_INDIVIDUAL = AI_N_CONTAINER * AI_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(FORM_N_INDIVIDUAL = FORM_N_CONTAINER * FORM_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(AI_SE_INDIVIDUAL = AI_ERROR_LOWER) %>%
+  mutate(FORM_SE_INDIVIDUAL = FORM_ERROR_LOWER)
+
+data_allSE <- bind_rows(data_SE, data_CI, data_SD)
+```
+
+*Sort out one row that has mixed errors*
+
+```{r}
+mixed_error_rows <- excluded %>%
+  filter(REASON_EXCLUSION == "Not_same_error_type")
+# There is just one , where the AI is SE and form is CI, but careful if other ones
+
+mixed_error_fixed <- mixed_error_rows %>%
+  mutate(AI_N_INDIVIDUAL = AI_N_CONTAINER * AI_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(FORM_N_INDIVIDUAL = FORM_N_CONTAINER * FORM_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(AI_SE_INDIVIDUAL = AI_ERROR_LOWER) %>%
+  mutate(FORM_BIGGEST_CI_ARM = pmax(FORM_ERROR_HIGHER, FORM_ERROR_LOWER)) %>%
+  mutate(FORM_SE_INDIVIDUAL = FORM_BIGGEST_CI_ARM/(-qt(0.025, df = FORM_N_INDIVIDUAL - 1)))
+  
+# Putting it back in the dataset and out from excluded 
+
+data_allSE <- bind_rows(data_allSE, mixed_error_fixed)
+
+excluded <- anti_join(excluded, mixed_error_rows)
+
+```
+
+
+Now doing the same process for the missing se dataframe (because often one is missing and the other one is there)
+
+```{r}
+# Separating into different types of error 
+data_missing_only_ci <- data_missing_cleaned %>%
+  filter(AI_ERROR_TYPE == "CI_95" | FORM_ERROR_TYPE == "CI_95")
+
+data_missing_only_se <- data_missing_cleaned %>%
+  filter(AI_ERROR_TYPE == "SE" | FORM_ERROR_TYPE == "SE")
+
+data_missing_only_sd <- data_missing_cleaned %>%
+  filter(AI_ERROR_TYPE == "SD" | FORM_ERROR_TYPE == "SD")
+
+data_missing_both <- data_missing_cleaned %>%
+  filter(is.na(FORM_ERROR_TYPE) & is.na(AI_ERROR_TYPE))
+```
+
+```{r}
+# Checking
+nrow(data_missing_only_ci) + nrow(data_missing_only_sd) + nrow(data_missing_only_se) + nrow(data_missing_both) == nrow(data_missing_cleaned)
+```
+```{r}
+data_missing_only_ci <- data_missing_only_ci %>%
+    mutate(AI_N_INDIVIDUAL = AI_N_CONTAINER * AI_N_INDIVIDUALS_PER_CONTAINER) %>%
+    mutate(FORM_N_INDIVIDUAL = FORM_N_CONTAINER * FORM_N_INDIVIDUALS_PER_CONTAINER) 
+
+# Separating for ai and form, because one of them is NA and the other is not 
+data_missing_only_ci_form <- data_missing_only_ci %>%
+  filter(FORM_ERROR_TYPE == "CI_95")%>%
+  # Creating columns to select the biggest of two CI arms and the individual sample size
+  mutate(FORM_BIGGEST_CI_ARM = pmax(FORM_ERROR_HIGHER, FORM_ERROR_LOWER)) %>%
+  # Calculating the SE from t statistic and sample size
+  mutate(FORM_SE_INDIVIDUAL = FORM_BIGGEST_CI_ARM/(-qt(0.025, df = FORM_N_INDIVIDUAL - 1)))
+  
+  
+data_missing_only_ci_ai <- data_missing_only_ci %>%
+  filter(AI_ERROR_TYPE == "CI_95") %>%
+  # Creating columns to select the biggest of two CI arms and the individual sample size
+  mutate(AI_BIGGEST_CI_ARM = pmax(AI_ERROR_HIGHER, AI_ERROR_LOWER))%>%
+  # Calculating the SE from t statistic and sample size
+  mutate(AI_SE_INDIVIDUAL = AI_BIGGEST_CI_ARM/(-qt(0.025, df = AI_N_INDIVIDUAL - 1)))
+
+data_missing_only_ci_semifixed <- bind_rows(data_missing_only_ci_form, data_missing_only_ci_ai)
+  
+```
+
+
+```{r}
+# Doing the same for SD 
+
+data_missing_only_sd <- data_missing_only_sd %>%
+    mutate(AI_N_INDIVIDUAL = AI_N_CONTAINER * AI_N_INDIVIDUALS_PER_CONTAINER) %>%
+    mutate(FORM_N_INDIVIDUAL = FORM_N_CONTAINER * FORM_N_INDIVIDUALS_PER_CONTAINER) 
+
+# Separating for ai and form, because one of them is NA and the other is not 
+data_missing_only_sd_form <- data_missing_only_sd %>%
+  filter(FORM_ERROR_TYPE == "SD")%>%
+  # Calculating the SE from sample size
+  mutate(FORM_SE_INDIVIDUAL = FORM_ERROR_LOWER/sqrt(FORM_N_INDIVIDUAL))
+  
+  
+data_missing_only_sd_ai <- data_missing_only_sd %>%
+  filter(AI_ERROR_TYPE == "SD") %>%
+  # Calculating the SE from sample size
+  mutate(AI_SE_INDIVIDUAL = AI_ERROR_LOWER/sqrt(AI_N_INDIVIDUAL))
+
+data_missing_only_sd_semifixed <- bind_rows(data_missing_only_sd_form, data_missing_only_sd_ai)
+```
+
+```{r}
+# Rejoining all the types of error 
+
+data_missing_only_se_semifixed <- data_missing_only_se %>%
+  # Adding the same columns than the other dataframes
+  mutate(AI_N_INDIVIDUAL = AI_N_CONTAINER * AI_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(FORM_N_INDIVIDUAL = FORM_N_CONTAINER * FORM_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(AI_SE_INDIVIDUAL = AI_ERROR_LOWER) %>%
+  mutate(FORM_SE_INDIVIDUAL = FORM_ERROR_LOWER)
+
+data_missing_both <- data_missing_both %>%
+  # Adding the same columns than the other dataframes
+  mutate(AI_N_INDIVIDUAL = AI_N_CONTAINER * AI_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(FORM_N_INDIVIDUAL = FORM_N_CONTAINER * FORM_N_INDIVIDUALS_PER_CONTAINER) %>%
+  mutate(AI_SE_INDIVIDUAL = AI_ERROR_LOWER) %>%
+  mutate(FORM_SE_INDIVIDUAL = FORM_ERROR_LOWER)  
+
+# Combining
+data_missing_error_semifixed <- bind_rows(data_missing_only_ci_semifixed, data_missing_only_sd_semifixed, data_missing_only_se_semifixed, data_missing_both)
+
+data_cleaned_not_imputed <- bind_rows(data_allSE, data_missing_error_semifixed) %>%
+  arrange(DATA_ID)
+```
+
+```{r}
+# Check 
+nrow(data_cleaned_not_imputed) + nrow(excluded) == nrow(all_data_formatted)
+```
+
+*Now calculate the ln(response ratio) and variance for each. Traditionally, LRR = ln(Xt/Xc). Do this for now and simply change the sign around if I want to demonstrate that the formulation is having a "greater" effect (positive). For now though, a negative sign shows the formulation is more toxic.* 
+
+```{r}
+data_cleaned_not_imputed <- data_cleaned_not_imputed %>%
+  # Calculating LRR
+  mutate(LRR = log(FORM_50/AI_50)) %>%
+  # Calculating LRR variance using delta method : var(lnRR) = SE_FORM^2/mean_FORM^2 + SE_AI^2/mean_AI^2
+  mutate(LRR_VAR_INDIVIDUAL = (FORM_SE_INDIVIDUAL^2 / FORM_50^2) + (AI_SE_INDIVIDUAL^2 / AI_50^2))
+   
+```
+
+
+Note: the tidying up in Guy's script doesn't need to be that thorough here because i've used tidyverse, but some needs to be done still. All the names changes were done in Excel directly. The formulation type changes were made at the beginning
+
+
+# Modelling without imputed SE data 
+
+Run analysis using data that doesn't require any SE simulation.
+
+Identify working model
+
+i) choose assumption for the correlation between sampling variances (try and combine common control and autoregressive correlation matrices)
+
+Trying a different correlation structure of the effect size **estimates**. Variance covariance matrix for the sampling variance. Specify a correlation structure with a "sampling auto-correlation" assumption.
+
+I used these sources:
+
+[Pustejovsky & Tipton 2021](https://link.springer.com/article/10.1007/s11121-021-01246-3). This reference explains how using RVE guards against misspecification. They recommend (1) choosing an assumption for the within-study correlation between effect size estimates, (2) identifying a structure for the random effects, and (3) determining whether to include any additional levels (like MULTIPLE_MEASUREMENT). I have done all this but not in the same order because I realised (3) had to be done when I was extracting my data, I was familiar with (2) from my previous experience with mixed effects models and I have struggled with implementing (1) beyond the shared control. I think I am going to have to pick either the shared control approach or AR approach for the effect size estimate correlation structure.
+
+Here is a useful excerpt from the above paper,
+
+"Although RVE standard errors are statistically valid under any set of weights, the choice of weights does impact the precision of the meta-regression coefficient estimator (βˆ). The most precise estimator results when the weights are exactly inverse of the true variance–covariance matrix. However, because the true covariance matrix Φ𝑗 is unknown, we must in practice use a working model—meaning a good guess or rough approximation—for purposes of developing weight matrices. If the working model is correct, the resulting weights are exactly inverse variance, and the meta-regression estimator is fully efficient. If the working model is only close to correct, the resulting weights are still approximately inverse variance, and the meta-regression estimator is still close to efficient. In contrast, if the working model is quite discrepant from the true covariance structure, the meta-regression estimator may be much less efficient, although it is still unbiased and inferences based on RVE remain statistically valid. Thus, the choice of working model and associated weight matrices offer a means to improve the precision of meta-regression coefficient estimates."
+
+So it is worth spending time trying to get an accurate var-cov matrix for the effect size estimates/sampling variance.
+
+I have autocorrelation in my sample variances within MULTIPLE_MEASUREMENT. I also have dependence because some effect sizes share common controls. 
+
+I want to combine these two forms of dependence into one variance covariance matrix using vcalc but I can't work out how to do it.
+
+Before I do this I have to create the TIME_SIMPLE variable. As I will be using an AR structure, time is assumed to be evenly spaced. Even though it isn't really this is still a marked improvement than not having a time dependent structure (and it performed better than the structure that did allow for time to be non-evenly spaced).
+
+Make TIME_SIMPLE: a false unit of time for multiple measurements experiments
+Example: if 24, 48, 72 -> 1, 2, 3
+
+
+
+
+
+```{r}
+data_cleaned_not_imputed <- data_cleaned_not_imputed %>%
+  group_by(MULTIPLE_MEASUREMENT) %>%
+  arrange(MULTIPLE_MEASUREMENT, EXPOSURE_DURATION_HOURS) %>%
+  mutate(TIME_SIMPLE = row_number()) %>%
+  ungroup()
+
+
+# Saving for after 
+data_everybody_before_exclusions <- data_cleaned_not_imputed
+```
+
+First some exclusions
+
+## Excluding problematic data 
+
+### Influential effect sizes 
+
+Identify influential effect sizes. It is hard to work out where to put this in the flow of the analysis. I identified influential effect sizes using a leave one out approach. Initially, I did this once I had performed my model selection so I used the final model. I will do the same again but it is useful to exclude the influential points now. Add them to the excluded dataframe and run the analysis with them later to show the effect it has on the results.
+
+Remove 409 and 410 as these had a large impact on the results for fungicide.
+
+```{r}
+to_exclude <- data_cleaned_not_imputed %>%
+  filter(DATA_ID %in% c(409, 410))
+
+excluded <- excluded %>%
+  bind_rows(to_exclude %>%
+              mutate(REASON_EXCLUSION = "Influential_fungicide_seeGuy"))
+
+data_cleaned_not_imputed <- data_cleaned_not_imputed %>%
+  filter(!DATA_ID %in% c(409,410))
+```
+
+### Too big error 
+
+At this stage also remove all effect sizes where the biggest CI arm was >10 times the point estimate for the LD50 as this indicates to me that the model was not fitted correctly in the primary source. I will again run the final model with these points to see their influence on the conclusions. I doubt there will be much effect as the vi on these is all very high, making their weight very low.
+
+Here I modified from Guy to exclude when the SE was 10 times higher, because it happens when I computed from figures 
+
+```{r}
+to_exclude <- data_cleaned_not_imputed %>%
+  filter(AI_SE_INDIVIDUAL > AI_50*10 | FORM_SE_INDIVIDUAL > FORM_50*10)
+
+excluded <- excluded %>%
+  bind_rows(to_exclude %>% 
+              mutate(REASON_EXCLUSION = "Error_supp_10_times_value"))
+
+data_cleaned_not_imputed <- anti_join(data_cleaned_not_imputed, to_exclude)
+```
+### Phylogenetic independance
+
+Remove effect size derived from a microbial community and cell lines as this causes issues later when a phylogenetic species term wants to be added to the random effects. Again, add it back in later to see effect on results.
+
+Note: this also may apply to other single bacteria ? 
+
+```{r}
+to_exclude <- data_cleaned_not_imputed %>%
+  filter(is.na(SPECIES_NAME_BINOMIAL))
+
+excluded <- excluded %>%
+  bind_rows(to_exclude %>%
+              mutate(REASON_EXCLUSION = "microbial_or_cells"))
+
+data_cleaned_not_imputed <- anti_join(data_cleaned_not_imputed, to_exclude)
+```
+Excluding some rows where the taxon is not on the open tree of life, so they will not have a phylogenetic correlation term 
+
+```{r}
+taxa <- unique(data_cleaned_not_imputed$SPECIES_NAME_BINOMIAL)
+
+# resolves names. A few of the names were older synonyms
+resolved_names <- tnrs_match_names(taxa)
+
+# Two taxa are not in the tree of life so I'll remove them for now 
+
+to_exclude_names <- resolved_names %>%
+  filter(flags %in% c("hidden", "incertae_sedis")) %>%
+  distinct(unique_name) %>%
+  mutate(first_two = word(unique_name, 1, 2)) # because some rows have additionnal info in unique name 
+  
+
+to_exclude <- data_cleaned_not_imputed %>%
+  filter(SPECIES_NAME_BINOMIAL %in% to_exclude_names$first_two)
+  
+
+excluded <- excluded %>%
+  bind_rows(to_exclude %>% mutate(REASON_EXCLUSION = "Name_not_in_open_tree"))
+
+data_cleaned_not_imputed <- anti_join(data_cleaned_not_imputed, to_exclude)
+```
+
+## Correlation matrices
+
+### Correlation between multiple measurements
+
+Define first VCV matrix using vcalc in metafor. Filter out the data that needs imputing. This VCV matrix accounts for autocorrelation.
+
+```{r}
+# Separating again into missing/no_missing
+
+data_cleaned_no_missing <- data_cleaned_not_imputed %>%
+   filter(SE_SIMULATION_REQUIRED == "NO")
+
+data_cleaned_with_missing <- data_cleaned_not_imputed %>%
+  filter(SE_SIMULATION_REQUIRED == "YES")
+
+# Correlation
+
+autocorrelation_matrix <- metafor::vcalc(vi = data_cleaned_no_missing$AI_ERROR_LOWER,
+               cluster = MULTIPLE_MEASUREMENT,
+               time1 = TIME_SIMPLE,
+               phi= 0.8,
+               data= data_cleaned_no_missing)
+
+
+
+# visualise the correlation
+# Set the chunk size (e.g., 50 rows/columns at a time)
+chunk_size <- 50
+n <- nrow(autocorrelation_matrix)
+
+# Loop through chunks and plot each
+for (i in seq(1, n, by = chunk_size)) {
+  end <- min(i + chunk_size - 1, n)
+  corrplot(cov2cor(autocorrelation_matrix[i:end, i:end]))
+}
+
+# order by multiple_measurement shows that the correlation structure is fine
+# looks odd above because of the order I input it into the dataframe
+
+structure_check <- data_cleaned_no_missing %>%
+  arrange(MULTIPLE_MEASUREMENT)
+
+structure_check_matrix <- metafor::vcalc(vi = structure_check$LRR_VAR_INDIVIDUAL,
+               cluster = MULTIPLE_MEASUREMENT,
+               time1 = TIME_SIMPLE,
+               phi= 0.8,
+               data= structure_check)
+
+# Set the chunk size (e.g., 50 rows/columns at a time)
+chunk_size <- 50
+n <- nrow(structure_check_matrix)
+
+# Loop through chunks and plot each
+for (i in seq(1, n, by = chunk_size)) {
+  end <- min(i + chunk_size - 1, n)
+  corrplot(cov2cor(structure_check_matrix[i:end, i:end]))
+}
+
+cairo_pdf("output/sampling_variance_correlation_50_100_plot.pdf")
+corrplot::corrplot(cov2cor(structure_check_matrix) [50:100, 50:100])
+dev.off()
+
+```
+### Correlation between common controls
+
+*Define function so I can input se instead of sd and n when calculating common control VCV matrix*
+
+*Update the make_VCV_matrix and vcalc functions to take SE instead of SD and n.*
+
+*The functions I am altering originally came from the metaAidR package and the common control VCV method was described in this [online workshop tutorial](https://daniel1noble.github.io/meta-workshop/complex-nonind)*
+
+Note from Lisa : This chunk of code corresponding to this doesn't work, even in the original file. It does not work either when using the original functions from the metaAidR package and creating a sd column. Leaving it out for now 
+
+
+*I am not sure whether combining two VCV matrices in the way I attempted is valid. Probably not. I can account for both using [vcalc](https://wviechtb.github.io/metadat/reference/dat.knapp2017.html) but the implementation is challenging. Look into it but for now go forward with the autocorrelation_matrix.*
+
+*ii) identify random effects structure and iii) add additional levels.*
+
+These seems to be the most updated guides
+
+*[Nagakawa - guide](https://environmentalevidencejournal.biomedcentral.com/articles/10.1186/s13750-023-00301-6#Sec13)
+[Nagakawa - guide associated tutorial](https://itchyshin.github.io/Meta-analysis_tutorial/)
+[Nagakawa - publication bias](https://itchyshin.github.io/publication_bias/#Appendix_extra:_Figure%E2%80%99s_R_code)*
+
+*Here's my list of potential random effects:*
+
+1) ~1 | STUDY (between study variation)
+
+2) ~1 | DATA_ID (within study variation (residual variance))
+
+3) ~1 | SPECIES_NAME_BINOMIAL_OTL (control for evolutionary relatedness. For example, co-formulants are expected to affect two species of water flea more                                    similarly than a bacteria due to more similar molecular and cellular targets, due to a shared evolutionary history)
+
+4) ~1 | SPECIES_NAME_BINOMIAL (the non-phylogenetic relatedness, this controls for ecological similarities like being both aquatic. Failing to include this term will often inflate the phylogenetic variance)
+
+5) A way to capture MULTIPLE_MEASUREMENTS, through time.
+
+*For my meta-analysis MULTIPLE_MEASUREMENT indicates where multiple ED50s were extracted from the same group of organisms. For example, a group of organisms were treated with the ai or formulation at t=0. Then, ED50s were calculated at 24,48 and 96h using the same group of organisms. This is time so will require some correlation structure.*
+
+*I will try 3 approaches of increasing complexity*
+
+i) ~1 | MULTIPLE_MEASUREMENT
+ii) TIME | MULTIPLE_MEASUREMENT, struct = "AR"
+iii) TIME | MULTIPLE_MEASUREMENT, structure = "CAR"
+
+*i) this correlation structure is often too simplistic for time series, but may still be useful for short time series. All of my time series have <5 time points apart from 2, which have 7. Therefore, it may suffice. The difference between ii) and iii) is AR assumes that time points are evenly spaced where CAR does not. AR may be enough to capture the time correlation, even if it isn't strictly true.*
+
+*There is a model selection section in the associated tutorial. What they say contradicts Zuur and other sources regarding model selection of random effects. They said that you should always change to "ML" when you only have to when performing model selection on fixed effects. REML is actually slightly better when looking at random effects while fixed effects remain constant.*
+
+*Their guides seems to do a simple form of forward selection. I'll perform forward selection as in Zuur. Pick the most significant term, then add and continue, building the model up.*
+
+*Let's see which of these random effects improve model fit. *
+
+*Before I do this I have to code the phylogenetic random effect. *
+
+*Phylogenetic reconstruction at the species level. To do this I followed this [online workshop tutorial](https://daniel1noble.github.io/meta-workshop/phylo)*
+
+### Phylogenetic correlation
+
+```{r}
+
+# Re-doing the taxa names
+taxa2 <- unique(data_cleaned_no_missing$SPECIES_NAME_BINOMIAL)
+
+# resolves names. A few of the names were older synonyms
+resolved_names2 <- tnrs_match_names(taxa2)
+
+my_tree <- tol_induced_subtree(ott_ids = resolved_names2$ott_id, label_format = "name")
+
+plot(my_tree, type = "phylogram", cex = 0.3)
+
+# Adding the updated names to the data 
+
+# Creating a function that capitalizes the first letter 
+capitalize_first <- function(x) {
+  paste0(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))))
+}
+
+# creating a column in resolve name with only two words for the name 
+update_name <- resolved_names2 %>%
+  mutate(SPECIES_NAME_BINOMIAL_OTL = unique_name) %>%
+  mutate(SPECIES_NAME_BINOMIAL = capitalize_first(search_string)) %>%
+  dplyr::select(SPECIES_NAME_BINOMIAL, SPECIES_NAME_BINOMIAL_OTL)
+
+
+#  Join the updated names into the full data
+data_cleaned_no_missing <- data_cleaned_no_missing %>%
+  left_join(update_name, by = "SPECIES_NAME_BINOMIAL") 
+
+# Adding a _
+
+data_cleaned_no_missing <- data_cleaned_no_missing %>%
+  mutate(SPECIES_NAME_BINOMIAL_OTL = str_replace_all(SPECIES_NAME_BINOMIAL_OTL, " ", "_"))
+```
+
+```{r}
+# Check: is there a match between tree tips labels and names in the dataset 
+
+tree_tip_label <- my_tree$tip.label
+diff <- setdiff(tree_tip_label, data_cleaned_no_missing$SPECIES_NAME_BINOMIAL_OTL) 
+diff
+```
+```{r}
+# calculate branch lengths
+my_tree <- ape::compute.brlen(my_tree, method = "Grafen", power = 1)
+
+# use a randomization approach to deal with polytomies
+my_tree <- ape::multi2di(my_tree, random = TRUE)
+
+# create correlation matrix for analysis
+phylo_cor <- vcv(my_tree, cor = T)
+
+# save species tree
+cairo_pdf("output/species_tree_plot.pdf")
+plot(my_tree, type = "phylogram", cex = 0.3)
+dev.off()
+```
+
+# Model selection
+
+
+```{r}
+# Making some factors 
+# i'm not sure this is useful so leaving it out for now 
+#data_cleaned_no_missing <- data_cleaned_no_missing %>%
+#  mutate(DATA_ID = as.factor(DATA_ID)) %>%
+#  mutate(FORMULATION_TYPE = as.factor(FORMULATION_TYPE)) %>%
+#  mutate(STUDY_ID = as.factor(STUDY_ID)) %>%
+#  mutate(MULTIPLE_MEASUREMENT = as.factor(MULTIPLE_MEASUREMENT)) %>%
+#  mutate(COMMON_CONTROL = as.factor(COMMON_CONTROL)) %>%
+#  mutate(FORM_ERROR_TYPE = as.factor(FORM_ERROR_TYPE)) %>%
+#  mutate(AI_ERROR_TYPE = as.factor(AI_ERROR_TYPE)) %>%
+#  mutate(EXPOSURE_ROUTE = as.factor(EXPOSURE_ROUTE)) %>%
+#  mutate(AI_ERROR_TYPE = as.factor(AI_ERROR_TYPE)) %>%
+#  mutate(REGULATORY_STANDARDISED_GUIDELINES_FOLLOWED = as.factor(REGULATORY_STANDARDISED_GUIDELINES_FOLLOWED)) %>%
+#  mutate(SPECIES_NAME_BINOMIAL = as.factor(SPECIES_NAME_BINOMIAL)) %>%
+#  mutate(SPECIES_PHYLUM = as.factor(SPECIES_PHYLUM)) %>%
+#  mutate(SPECIES_KINGDOM = as.factor(SPECIES_KINGDOM)) %>%
+#  mutate(ECOSYSTEM = as.factor(ECOSYSTEM)) %>%
+#  mutate(FORM_NAME = as.factor(FORM_NAME)) %>%
+#  mutate(AI_NAME = as.factor(AI_NAME))
+
+
+#data_cleaned_not_imputed <- data_cleaned_not_imputed %>%
+#  mutate(DATA_ID = as.factor(DATA_ID)) %>%
+#  mutate(FORMULATION_TYPE = as.factor(FORMULATION_TYPE)) %>%
+#  mutate(STUDY_ID = as.factor(STUDY_ID)) %>%
+#  mutate(MULTIPLE_MEASUREMENT = as.factor(MULTIPLE_MEASUREMENT)) %>%
+#  mutate(COMMON_CONTROL = as.factor(COMMON_CONTROL)) %>%
+#  mutate(FORM_ERROR_TYPE = as.factor(FORM_ERROR_TYPE)) %>%
+#  mutate(AI_ERROR_TYPE = as.factor(AI_ERROR_TYPE)) %>%
+#  mutate(EXPOSURE_ROUTE = as.factor(EXPOSURE_ROUTE)) %>%
+#  mutate(AI_ERROR_TYPE = as.factor(AI_ERROR_TYPE)) %>%
+#  mutate(REGULATORY_STANDARDISED_GUIDELINES_FOLLOWED = as.factor(REGULATORY_STANDARDISED_GUIDELINES_FOLLOWED)) %>%
+#  mutate(SPECIES_NAME_BINOMIAL = as.factor(SPECIES_NAME_BINOMIAL)) %>%
+#  mutate(SPECIES_PHYLUM = as.factor(SPECIES_PHYLUM)) %>%
+#  mutate(SPECIES_KINGDOM = as.factor(SPECIES_KINGDOM)) %>%
+#  mutate(ECOSYSTEM = as.factor(ECOSYSTEM)) %>%
+#  mutate(FORM_NAME = as.factor(FORM_NAME)) %>%
+#  mutate(AI_NAME = as.factor(AI_NAME))
+```
+
+*Starting with a NULL model with all the potential fixed effects and the autocorrelation vcv matrix.*
+
+## Forward selection for random effects 
+
+### Round 1: Comparing null model to individual random effects 
+
+
+```{r}
+# NULL model
+null_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+```
+
+Adding random effects one by one and testing their significance
+```{r}
+# ROUND 1
+# add STUDY_ID as random effect
+study_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    random = list(~1 | STUDY_ID),
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# STUDY_ID is significant
+anova.rma(null_mod, study_mod)
+```
+
+
+```{r}
+# add DATA_ID as a random effect
+es_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    random = list(~1 | DATA_ID),
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# DATA_ID is significant
+anova.rma(null_mod, es_mod)
+```
+
+
+```{r}
+# phylogenetic species term SPECIES_NAME_BINOMIAL_OTL
+phylo_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    random = list(~1 | SPECIES_NAME_BINOMIAL_OTL),
+                    R = list(SPECIES_NAME_BINOMIAL_OTL = phylo_cor),
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# the phylogenetic structure is significant
+anova.rma(null_mod, phylo_mod)
+```
+
+
+```{r}
+# non-phylogenetic species term SPECIES_NAME_BINOMIAL_OTL
+species_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    random = list(~1 | SPECIES_NAME_BINOMIAL_OTL),
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# significant
+anova.rma(null_mod, species_mod)
+```
+
+
+```{r}
+# SIMPLE_TIME | MULTIPLE_MEASUREMENT term
+ar_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# significant
+anova.rma(null_mod, ar_mod)
+```
+
+
+
+### Round 2 : Compare random effect to the model accounting for multiple measurements 
+
+```{r}
+# ROUND 2, AR is now the reference
+# AR + DATA_ID. MULTIPLE_MEASUREMENT has replaced DATA_ID really.
+# all moderators are either at study level or multiple_measurement level (apart from TIME_SIMPLE)
+ar_es_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | DATA_ID,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# It is slightly significant for me 
+anova.rma(ar_mod, ar_es_mod)
+```
+
+
+```{r}
+# AR + STUDY_ID
+ar_study_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | STUDY_ID,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# significant
+anova.rma(ar_mod, ar_study_mod)
+```
+
+
+```{r}
+# AR + phylo
+ar_phylo_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | SPECIES_NAME_BINOMIAL_OTL,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                 R = list(SPECIES_NAME_BINOMIAL_OTL = phylo_cor),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# slihtly significant 
+anova.rma(ar_mod, ar_phylo_mod)
+```
+
+
+```{r}
+# AR + species
+ar_species_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | SPECIES_NAME_BINOMIAL_OTL,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# significant
+anova.rma(ar_mod, ar_species_mod)
+```
+
+### Round 3
+```{r}
+# ROUND 3 AR + STUDY_ID now reference
+# AR + study + phylo
+ar_study_phylo_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | STUDY_ID,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT,
+                               ~1 | SPECIES_NAME_BINOMIAL_OTL),
+                 R = list(SPECIES_NAME_BINOMIAL_OTL = phylo_cor),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# not significant
+anova(ar_study_mod, ar_study_phylo_mod)
+```
+
+
+```{r}
+# AR + study + species
+ar_study_species_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | STUDY_ID,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT,
+                               ~1 | SPECIES_NAME_BINOMIAL_OTL),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# not significant
+anova(ar_study_mod, ar_study_species_mod)
+```
+
+
+```{r}
+# AR + study + data ID
+ar_study_data_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | STUDY_ID,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT,
+                               ~1 | DATA_ID),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# slighly  significant
+anova(ar_study_mod, ar_study_data_mod)
+```
+### Round 4
+
+```{r}
+# Round 4 : AR + STUDY + DATA is the new reference 
+# AR + study + data + phylo 
+ar_study_data_phylo_mod <-  rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | STUDY_ID,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT,
+                               ~1 | SPECIES_NAME_BINOMIAL_OTL, 
+                               ~1 | DATA_ID),
+                 R = list(SPECIES_NAME_BINOMIAL_OTL = phylo_cor),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# not significant 
+anova(ar_study_data_mod, ar_study_data_phylo_mod)
+```
+```{r}
+# AR + study + data + species 
+ar_study_data_species_mod <-  rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | STUDY_ID,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT,
+                               ~1 | SPECIES_NAME_BINOMIAL_OTL, 
+                               ~1 | DATA_ID),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+# not significant 
+anova(ar_study_data_mod, ar_study_data_species_mod)
+```
+
+
+
+```{r}
+# this is the final model in relation to the random effects
+ar_study_data_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                 mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                 random = list(~1 | STUDY_ID,
+                               ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT, 
+                               ~1 | DATA_ID),
+                 struct = "AR",
+                 data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+summary(ar_study_data_mod)
+```
+
+Note: I've used the structure_check_matrix and not autocorrelation because autocorrelation has some NA in my case. 
+
+*What does this tell me? The between study variance is represented by STUDY_ID and the within study variance is now represented by MULTIPLE_MEASUREMENT. All my moderators can be thought of as at the MULTIPLE_MEASUREMENT level. Ie, FORMULATION_TYPE is the same when MULTIPLE_MEASUREMENT is the same.*
+
+## Backward model selection on fixed effects 
+
+```{r}
+# express the reference model using ML
+ar_study_data_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cleaned_no_missing, method = "ML", test = "t", dfs = "contain")
+```
+
+
+```{r}
+# GVIF to check for collinearity between moderators. Cutoff of 5 or 10 are sometimes used.
+vif(ar_study_data_mod, btt = c("PESTICIDE_CLASS", "EXPOSURE_ROUTE", "FORMULATION_TYPE"))
+```
+
+
+```{r}
+# backward selection for the fixed effect 
+
+ar_study_data_mod_a <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cleaned_no_missing, method = "ML", test = "t", dfs = "contain")
+
+ar_study_data_mod_b <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS + FORMULATION_TYPE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cleaned_no_missing, method = "ML", test = "t", dfs = "contain")
+
+ar_study_data_mod_c <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cleaned_no_missing, method = "ML", test = "t", dfs = "contain")
+```
+
+
+```{r}
+anova(ar_study_data_mod, ar_study_data_mod_a)
+# Not significant 
+```
+
+
+```{r}
+anova(ar_study_data_mod, ar_study_data_mod_b)
+# Not significant 
+```
+
+
+```{r}
+anova(ar_study_data_mod, ar_study_data_mod_c)
+# Significant 
+```
+We can see that dropping PESTICIDE CLASS worsens the fits 
+
+```{r}
+# 
+ar_study_data_mod_pest <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ PESTICIDE_CLASS,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cleaned_no_missing, method = "ML", test = "t", dfs = "contain")
+```
+
+
+```{r}
+anova(ar_study_data_mod_pest, ar_study_data_mod_b)
+# Not significant 
+```
+
+
+```{r}
+anova(ar_study_data_mod_pest, ar_study_data_mod_a)
+# Not significant 
+```
+
+
+```{r}
+# ar_study_data_mod_pest is the reference
+ar_study_data_mod_null <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ 1,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cleaned_no_missing, method = "ML", test = "t", dfs = "contain")
+
+anova(ar_study_data_mod_pest, ar_study_data_mod_null)
+# Significant 
+```
+
+
+```{r}
+# Comparing with the selection using MuMin
+
+eval(metafor:::.MuMIn) # use eval() function to extract helper functions from MuMIn and make them usable in metafor.
+
+mod.candidate <- dredge(ar_study_data_mod, beta = "none", evaluate = TRUE, rank = "AICc", trace=2) # dredge to produce all possible models
+
+# same as manual selection
+subset(mod.candidate, delta <= 2, recalc.weights = FALSE)
+```
+*Formulation type is currently undermined by the "liquid formulation" level. This was when studied didn't provide sufficient information to distinguish which formulation type they used. Rerun the model selection stage setting liquid formulation to NA and n/a to NA. Perform the model selection again. For now perform this on the non-imputed dataset.*
+
+*Exposure route is also be simplified so all the oral exposure classes are combined leaving oral, contact, environmental.*
+
+```{r}
+# Replacing liquid formulation and unsure by NAs
+data_cnm_form_adjusted <- data_cleaned_no_missing %>%
+  mutate(FORMULATION_TYPE = na_if(FORMULATION_TYPE, "liquid formulation")) %>%
+  mutate(FORMULATION_TYPE = na_if(FORMULATION_TYPE, "unsure")) %>%
+  drop_na(FORMULATION_TYPE)
+
+# Grouping oral exposure 
+
+data_cnm_form_adjusted <- data_cnm_form_adjusted %>%
+  mutate(EXPOSURE_ROUTE = case_when(
+    EXPOSURE_ROUTE %in% c("oral-gavage", "oral-food", "oral-proventriculus") ~ "oral",
+    TRUE ~ EXPOSURE_ROUTE
+  ))
+# 
+
+```
+Re-doing the fixed effect selection with this reduced dataset 
+
+```{r}
+# Re-doing an autocorrelation matrix with the reduced dataset 
+
+structure_check2 <- data_cnm_form_adjusted %>%
+  arrange(MULTIPLE_MEASUREMENT)
+
+structure_check_matrix2 <- metafor::vcalc(vi = structure_check2$LRR_VAR_INDIVIDUAL,
+               cluster = MULTIPLE_MEASUREMENT,
+               time1 = TIME_SIMPLE,
+               phi= 0.8,
+               data= structure_check2)
+
+```
+
+*In addition, the interaction between pesticide class and formulation type was tested. The biological precedent for this is that insecticides are generally more toxic for animals (majority of the dataset) than herbicides. If certain formulation types aid absorption into non-target organism tissues it would increase the concentration of the AI in tissues where it can have toxic effects. If inherent AI toxicity is higher for insecticides compared herbicides/fungicides, it would follow that increase insecticide concentrations in target tissues would increase toxicity, where this is less likely to be the case for a herbicides are fungicides, where the AI is usually less toxic (and the proportional contribution of the co-formulants to total formulation toxicity is potentially higher).*
+
+```{r}
+# Testing for the interaction between pesticide class and formulation type 
+ar_study_data_mod_int <- rma.mv(yi = LRR, V = structure_check_matrix2,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE +
+                      PESTICIDE_CLASS:FORMULATION_TYPE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cnm_form_adjusted, method = "ML", test = "t", dfs = "contain")
+
+ar_study_data2_mod <- rma.mv(yi = LRR, V = structure_check_matrix2,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cnm_form_adjusted, method = "ML", test = "t", dfs = "contain")
+
+anova(ar_study_data2_mod, ar_study_data_mod_int)
+# Not significant, dropping the interaction term 
+```
+```{r}
+# GVIF to check for collinearity between moderators. Cutoff of 5 or 10 are sometimes used.
+vif(ar_study_data2_mod, btt = c("PESTICIDE_CLASS", "EXPOSURE_ROUTE", "FORMULATION_TYPE"))
+# Has significantly reduced vif to clean the dataset 
+```
+```{r}
+# Re-doing the backward selection 
+
+ar_study_data_mod_a2 <- rma.mv(yi = LRR, V = structure_check_matrix2,
+                    mod = ~ PESTICIDE_CLASS + EXPOSURE_ROUTE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cnm_form_adjusted, method = "ML", test = "t", dfs = "contain")
+
+ar_study_data_mod_b2 <- rma.mv(yi = LRR, V = structure_check_matrix2,
+                    mod = ~ PESTICIDE_CLASS + FORMULATION_TYPE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cnm_form_adjusted, method = "ML", test = "t", dfs = "contain")
+
+ar_study_data_mod_c2 <- rma.mv(yi = LRR, V = structure_check_matrix2,
+                    mod = ~ EXPOSURE_ROUTE + FORMULATION_TYPE,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cnm_form_adjusted, method = "ML", test = "t", dfs = "contain")
+```
+
+```{r}
+anova(ar_study_data2_mod, ar_study_data_mod_a2)
+
+```
+
+```{r}
+anova(ar_study_data2_mod, ar_study_data_mod_b2)
+```
+
+```{r}
+anova(ar_study_data2_mod, ar_study_data_mod_c2)
+```
+We have the same result: pesticide class should not be dropped
+
+```{r}
+# Continuing the backward selection
+ar_study_data_mod_pest2 <- rma.mv(yi = LRR, V = structure_check_matrix2,
+                    mod = ~ PESTICIDE_CLASS,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cnm_form_adjusted, method = "ML", test = "t", dfs = "contain")
+
+anova(ar_study_data_mod_a2, ar_study_data_mod_pest2)
+anova(ar_study_data_mod_b2, ar_study_data_mod_pest2)
+# Both not significant 
+```
+```{r}
+ar_study_data_mod_null2 <- rma.mv(yi = LRR, V = structure_check_matrix2,
+                    mod = ~ 1,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cnm_form_adjusted, method = "ML", test = "t", dfs = "contain")
+
+anova(ar_study_data_mod_null2, ar_study_data_mod_pest2)
+# Significant 
+```
+So the model selection with a reduced dataset due to unsure formulations yielded the same final model: 
+
+```{r}
+# Final model with REML
+final_model_reml <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ 0 + PESTICIDE_CLASS,
+                    random = list(~1 | STUDY_ID,
+                                  ~1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+
+# I'm not sure what this is doing 
+# RVE
+robust(final_model_reml, cluster = data_cleaned_no_missing$STUDY_ID, clubSandwich = TRUE)
+
+# PIs
+mod_results(final_model_reml, group = "STUDY_ID", mod = "PESTICIDE_CLASS")$mod_table
+```
+Note : using only study id as cluster is fine as data id is nested in study id 
+
+*Comparing the CIs around herbicide for RVE and the normal approach shows that we have done a pretty good job at developing our working model.*
+
+*Most of the checks below stem from this [Nagakawa Paper](https://environmentalevidencejournal.biomedcentral.com/articles/10.1186/s13750-023-00301-6#Sec8) and associated [practical guide](https://itchyshin.github.io/Meta-analysis_tutorial/#checking-for-publication-bias-and-robustness)*
+
+*Now I have a final working model I will perform a leave1out analysis to test the effects of leaving out each effect size individually. Use the full dataset. *
+
+Note: I don't think we should be using the full dataset, but only the one where we didn't remove the influential ones, otherwise the comparison is not valid.
+
+*The chunk below takes a long, long time (2h) to run. Don't run it. I saved the results in a csv and will provide these separately.*
+
+```{r}
+
+
+# # Keeping only without somlation but before the exclusions
+# data_evbdy_no_sim <- data_everybody_before_exclusions %>%
+#   filter(SE_SIMULATION_REQUIRED == "NO") %>%
+#   mutate(DATA_ID = factor(DATA_ID))
+
+# Helper function for one iteration
+fit_leave1out_model <- function(data_id_to_drop) {
+
+  dat <- data_cleaned_imputed_with_phylo %>% filter(DATA_ID != data_id_to_drop)
+
+  vcv <- metafor::vcalc(vi = dat$LRR_VAR_INDIVIDUAL,
+               cluster = dat$MULTIPLE_MEASUREMENT,
+               time1 = dat$TIME_SIMPLE,
+               phi = 0.8,
+               data = dat)
+
+ mod <- rma.mv(yi = LRR, V = vcv,
+               mod = ~ 0 + PESTICIDE_CLASS,
+              random = list(~1 | STUDY_ID,
+                           ~1 | DATA_ID,
+                             ~TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+               struct = "AR",
+               data = dat, method = "REML", test = "t", dfs = "contain")
+
+  # Extract coefficients in wide format
+  df <- data.frame(est = mod$b, lower = mod$ci.lb, upper = mod$ci.ub) %>%
+    rownames_to_column("class") %>%
+    pivot_wider(names_from = class,
+                values_from = c(est, lower, upper),
+                names_glue = "{tolower(class)}_{.value}") %>%
+    mutate(DATA_ID = data_id_to_drop)
+
+  return(df)
+}
+
+# Run leave-one-out over all DATA_IDs
+leave1out_results <- map_dfr(data_cleaned_imputed_with_phylo$DATA_ID, fit_leave1out_model)
+
+```
+```{r}
+write_csv(leave1out_results, "leave1out_results_all.csv")
+```
+
+```{r}
+# Getting the results from the csv from the long long chunk of code 
+leave1out <- read_csv("Output/leave1out_results.csv")
+
+# Will do a model with the full dataset to compare the leave1out results to 
+matrix_everybody <- metafor::vcalc(vi = data_evbdy_no_sim$LRR_VAR_INDIVIDUAL,
+               cluster = data_evbdy_no_sim$MULTIPLE_MEASUREMENT,
+               time1 = data_evbdy_no_sim$TIME_SIMPLE,
+               phi = 0.8,
+               data = data_evbdy_no_sim)
+
+
+leavenobody_mod <- rma.mv(yi = LRR, V = matrix_everybody,
+                mod = ~ 0 + PESTICIDE_CLASS,
+               random = list(~1 | STUDY_ID,
+                            ~1 | DATA_ID,
+                              ~TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                struct = "AR",
+                data = data_evbdy_no_sim, method = "REML", test = "t", dfs = "contain")
+
+# Getting the results of the model 
+
+mean_leavenobody <- summary(leavenobody_mod)$beta
+up_leavenobody <- summary(leavenobody_mod)$ci.ub  # lower bounds
+low_leavenobody <- summary(leavenobody_mod)$ci.lb  # upper bounds
+
+# Combine 
+estimates <- tibble(
+  PESTICIDE_CLASS = rownames(mean_leavenobody),
+  est = mean_leavenobody[, 1],
+  lower = low_leavenobody,
+  upper = up_leavenobody
+)
+
+# Getting it wide to substract to the leave1out results 
+estimates_wide <- estimates %>%
+  pivot_wider(names_from = PESTICIDE_CLASS,
+              values_from = c(est, lower, upper),
+              names_glue = "{PESTICIDE_CLASS}_{.value}") %>%
+  rename_with(tolower) 
+
+
+
+# Substracting 
+leave1out_diff <- leave1out %>%
+  dplyr::select(-DATA_ID) %>% 
+  mutate(across(
+    everything(),
+    ~ . - unlist(estimates_wide[1, cur_column()]),
+    .names = "{.col}_diff"
+  )) %>%
+  bind_cols(DATA_ID = leave1out$DATA_ID) %>%
+  dplyr::select(DATA_ID, ends_with("_diff"))
+
+# Influential is when there is a difference, I'm testing several thresholds
+influential <- leave1out_diff %>%
+  rowwise() %>%
+  filter(any(abs(c_across(ends_with("_diff"))) > 0.1)) %>%
+  ungroup()
+
+# Plotting the model with all the data 
+evbdy_model_orchard_plot <- orchard_plot(leavenobody_mod, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)
+
+evbdy_model_orchard_plot +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))
+
+
+
+```
+## Excluded data
+
+From Lisa: I want to put back the microbial and cell lines because the term related to species (phylogenetic and just species) are not in the model, so it doesn't matter that they have it or not. 
+
+I'm going to compute if it's making a difference or not. 
+
+This part is here and not in sensitivity analysis because I may chose to do all the following with the microbial dataset 
+
+```{r}
+# Define a function that gets a line of estimates from a model 
+estim_mod_wide <- function(mod, name){
+  # Extract the values from the model 
+  large_df <- data.frame(
+  PESTICIDE_CLASS = gsub("^PESTICIDE_CLASS", "", rownames(mod$beta)), # So that column names are identical
+  estimate = as.vector(mod$beta),
+  lower = mod$ci.lb,
+  upper = mod$ci.ub
+) %>%
+  mutate(model = name) %>%
+  dplyr::select(model, PESTICIDE_CLASS, estimate, lower, upper)
+  
+  # Put it in wide format 
+  wide_df <- large_df %>%
+  pivot_wider(
+    names_from = PESTICIDE_CLASS,
+    values_from = c(estimate, lower, upper)) %>%
+  mutate(across(-model, round, digits = 4))
+  
+  # Order the columns
+  # Get pesticide names from column suffixes
+  pesticides <- sub(".*_(.*)", "\\1", grep("^estimate_", names(wide_df), value = TRUE))
+  
+  # Build the desired column order
+  ordered_cols <- c("model", unlist(lapply(pesticides, function(p) {
+    c(paste0("estimate_", p), paste0("lower_", p), paste0("upper_", p))
+  })))
+  
+  # Reorder columns
+  wide_ordered <- wide_df[, ordered_cols]
+    
+  
+  return(wide_ordered)
+} 
+```
+
+```{r}
+phylo_excluded <- excluded %>%
+  filter(REASON_EXCLUSION %in% c("microbial_or_cells", "Name_not_in_open_tree"))
+  
+phylo_excluded_no_missing <- phylo_excluded %>%
+  filter(SE_SIMULATION_REQUIRED == "NO")
+
+phylo_excluded_se_missing <- phylo_excluded %>%
+  filter(SE_SIMULATION_REQUIRED == "YES")
+
+  
+data_cleaned_no_missing_phylo <- bind_rows(data_cleaned_no_missing, phylo_excluded_no_missing) 
+
+matrix_microbial <- metafor::vcalc(vi = data_cleaned_no_missing_phylo$LRR_VAR_INDIVIDUAL,
+               cluster = data_cleaned_no_missing_phylo$MULTIPLE_MEASUREMENT,
+               time1 = data_cleaned_no_missing_phylo$TIME_SIMPLE,
+               phi = 0.8,
+               data = data_cleaned_no_missing_phylo)
+
+model_microbial <- rma.mv(yi = LRR, V = matrix_microbial,
+                mod = ~ 0 + PESTICIDE_CLASS,
+               random = list(~1 | STUDY_ID,
+                            ~1 | DATA_ID,
+                              ~TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                struct = "AR",
+                data = data_cleaned_no_missing_phylo, method = "REML", test = "t", dfs = "contain")
+
+est_microbial <- estim_mod_wide(model_microbial, "phylo_included") 
+est_final <- estim_mod_wide(final_model_reml, "phylo_excluded")
+
+difference_microbial <- bind_rows(est_microbial, est_final)
+
+# Saving 
+
+final_table_comp <- difference_microbial %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(final_table_comp, "output/difference_phylo_excluded_included.pdf")
+
+```
+I don't know whether to include them or not but I'm creating the datasets in case I include them in the end. Careful because they are still in excluded though.
+
+```{r}
+data_cleaned_not_imputed_phylo <- bind_rows(data_cleaned_not_imputed, phylo_excluded) 
+data_cleaned_with_missing_phylo <- bind_rows(data_cleaned_with_missing, phylo_excluded_se_missing)
+```
+
+
+
+## Exploring heterogeneity  
+
+```{r}
+# define an intercept only model
+# can't use this with orchaRd but compare to results of simple model below.
+final_model_intercept <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ 1,
+                    random = list(~1 | STUDY_ID,
+                                  ~ 1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+summary(final_model_intercept)
+
+# simple model intercept only. For rough CV calculation
+# gives similar results to model above.
+final_model_simple_intercept <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~ 1,
+                    random = list(~1 | STUDY_ID/MULTIPLE_MEASUREMENT/DATA_ID),
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+summary(final_model_simple_intercept)
+```
+
+
+In the measuring heterogeneity of [shinichi guide](https://itchyshin.github.io/Meta-analysis_tutorial/#ref-midolo2019global) they quote,
+
+"In this worked example ([1]), the variation in the true effects (τ2+σ2) is 0.0706, which is quite large given the magnitude of the overall effect (β0
+ = 0.0297). Put differently, true effects’ heterogeneity is more than twice the magnitude of true effects (CV = 2.37)"
+ 
+ Using the final_model_simple_intercept to get a rough idea of this, overall intercept = -0.4478 and total heterogeneity =  0.8771 + 1.1662 + 0.0245 = 2.0678. 2.0678/0.4478 = 4.617686. So the heterogeneity of the true effects is almost five times the magnitude of true effects. If 2.37 was quite large then 4.62 is large/very large!
+
+Explore Heterogeneity. Now an issue I am having is orchaRd doesn't work with models with heterogeneous variance. Can use the simpler model with STUDY_ID/MULTIPLE_MEASUREMENT/DATA_ID
+
+```{r}
+# can run them using the simpler model
+simple_mod_selected <- rma.mv(yi = LRR, V = structure_check_matrix,
+                    mod = ~  0 + PESTICIDE_CLASS,
+                    random = list(~1 | STUDY_ID/MULTIPLE_MEASUREMENT/DATA_ID),
+                    data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+summary(simple_mod_selected)
+
+i2_ml(simple_mod_selected)
+
+r2_ml(simple_mod_selected)
+```
+
+
+Pesticide class explains 7.9% of the variation between effect sizes. Sampling variance accounts for 0.175637%, between study variance for 38.106501% and within study variance 60.440277% + 1.277584% = 61.71786% (all roughly).
+
+Trying to work I^2 out with the final model [metafor I^2 guide](https://www.metafor-project.org/doku.php/tips:i2_multilevel_multivariate). Look at multivariate section within it.
+
+```{r}
+# adapted from source linked above
+W <- solve(structure_check_matrix)
+X <- model.matrix(final_model_reml)
+P <- W - W %*% X %*% solve(t(X) %*% W %*% X) %*% t(X) %*% W
+
+# I^2 total
+100 * sum(final_model_reml$sigma2,final_model_reml$tau2) / (sum(final_model_reml$sigma2,final_model_reml$tau2) + (final_model_reml$k-final_model_reml$p)/sum(diag(P)))
+
+# between study
+100 * final_model_reml$sigma2/ (sum(final_model_reml$sigma2,final_model_reml$tau2) + (final_model_reml$k-final_model_reml$p)/sum(diag(P)))
+
+# within study
+100 * final_model_reml$tau2/ (sum(final_model_reml$sigma2,final_model_reml$tau2) + (final_model_reml$k-final_model_reml$p)/sum(diag(P)))
+
+# sampling variance
+100 - (100 * sum(final_model_reml$sigma2,final_model_reml$tau2) / (sum(final_model_reml$sigma2,final_model_reml$tau2) + (final_model_reml$k-final_model_reml$p)/sum(diag(P))))
+```
+
+Explore heterogeneity with prediction intervals. Shows there is a lot of heterogeneity and 95% of the time new effect size estimates will vary from -3.32 to 2.43.
+
+```{r}
+predict(final_model_intercept)
+```
+
+Orchard Plot.
+
+```{r}
+final_model_orchard_plot <- orchard_plot(final_model_reml, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5)+
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))
+
+cairo_pdf("output/final_model_orchard_plot.pdf")
+final_model_orchard_plot
+dev.off()
+```
+
+# Post Model Fitting Checks
+
+*Makes sure that the likelihood surface around the ML/REML estimates is not flat for some combination of the parameter estimates (which would imply that the estimates are essentially arbitrary). Seems to be fine.
+*
+
+This also takes a long time to run
+
+```{r}
+#profile(final_model_reml,
+#        progbar=TRUE,
+#        parallel="multicore")
+
+#par(mfrow=c(3,1))
+
+#profile.rma.mv(final_model_reml,
+#               tau2 = 1)
+
+#profile.rma.mv(final_model_reml,
+#               sigma2 = 1)
+
+#profile(final_model_reml, rho=1, xlim=c(0.90, 1))
+
+
+#cairo_pdf("output/parameter_identifiability_0.pdf")
+#profile(final_model_reml,
+#        progbar=TRUE,
+#        parallel="multicore")
+#dev.off()
+
+#cairo_pdf("output/parameter_identifiability.pdf")
+#par(mfrow=c(3,1))
+
+#profile.rma.mv(final_model_reml,
+#               tau2 = 1)
+
+#profile.rma.mv(final_model_reml,
+#               sigma2 = 1)
+
+#profile(final_model_reml, rho=1, xlim=c(0.90, 1))
+#dev.off()
+```
+
+## Publication Bias
+
+*All publication bias analyses follow this [Nagakawa Paper](https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/2041-210X.13724) and associated [supplementary](https://itchyshin.github.io/publication_bias/#Appendix_S4:_Multilevel_meta-regression_method_for_publication_bias)*
+
+```{r}
+# first off a funnel plot using precision. Sub optimal approach but can identify any outliers 
+# potentially due to inputting errors.
+funnel(data_cleaned_no_missing$LRR, data_cleaned_no_missing$LRR_VAR_INDIVIDUAL, yaxis="seinv",
+       #xlim = c(-3, 3),
+       ylab = "Precision (1/SE)",
+       xlab = "Effect size (lnRR)")
+
+# calculating "effective sample size" to account for unbalanced sampling, for lnRR 
+data_cleaned_no_missing <- data_cleaned_no_missing %>%
+    mutate(E_N = (4 * AI_N_INDIVIDUAL * FORM_N_INDIVIDUAL) / (AI_N_INDIVIDUAL + FORM_N_INDIVIDUAL))
+
+# using effective sampling size
+funnel(data_cleaned_no_missing$LRR, data_cleaned_no_missing$LRR_VAR_INDIVIDUAL, ni = data_cleaned_no_missing$E_N, yaxis="ni",
+       #xlim = c(-3, 3),
+       ylab = "Effective sample size",
+       xlab = "Effect size (lnRR)")
+
+
+# using effective sampling size just for herbicides
+data_cleaned_nm_herbicides <- data_cleaned_no_missing %>%
+  filter(PESTICIDE_CLASS == "herbicide")
+  
+funnel(data_cleaned_nm_herbicides$LRR,
+       data_cleaned_nm_herbicides$LRR_VAR_INDIVIDUAL,
+       ni = data_cleaned_nm_herbicides$E_N, yaxis="ni",
+       #xlim = c(-3, 3),
+       ylab = "Effective sample size",
+       xlab = "Effect size (lnRR)")
+
+# preparing the moderators that need to be included in a meta-regression that also contains a moderator with the standard errors of the effect sizes and the year of publication
+
+# calculating the inverse of the "effective sample size" to account for unbalanced sampling.
+data_cleaned_no_missing <- data_cleaned_no_missing %>%
+  mutate(INV_N_TILDA = (AI_N_INDIVIDUAL + FORM_N_INDIVIDUAL)
+         /(AI_N_INDIVIDUAL*FORM_N_INDIVIDUAL)) %>%
+  mutate(SQRT_INV_N_TILDA = sqrt(INV_N_TILDA))
+  
+
+
+# mean-centering year of publication to help with interpretation
+data_cleaned_no_missing <- data_cleaned_no_missing %>%
+  mutate(YEAR_CEN = scale(YEAR_PUBLISHED, scale = FALSE) %>% as.vector())
+
+data_cleaned_nm_herbicides <- data_cleaned_no_missing %>%
+  filter(PESTICIDE_CLASS == "herbicide")
+
+# as year and uncertainty increase with PESTICIDE_CLASS. The full publication bias check.
+publication_bias_all_mod <- rma.mv(yi = LRR, V = structure_check_matrix,
+                                                mods= ~ 1 + SQRT_INV_N_TILDA + YEAR_CEN + PESTICIDE_CLASS,
+                                                random = list(~1 | STUDY_ID,
+                                                              ~ 1 | DATA_ID,
+                                                              ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                                                struct = "AR",
+                                                data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+summary(publication_bias_all_mod)
+
+# publication bias doesn't seem to be an issue.
+```
+## Publication Bias Plots
+
+```{r}
+# predictions for YEAR_CEN = 0 and herbicide. No interaction term so 
+# relationship the same for all PESTICIDE_CLASS levels
+
+
+# create a grid of new moderator value
+X_names <- colnames(model.matrix(~ SQRT_INV_N_TILDA + YEAR_CEN + PESTICIDE_CLASS, data = data_cleaned_no_missing))
+
+# Create a tibble with zeros, except for the sequence for SQRT_INV_N_TILDA and the correct class set to 1
+pred_data <- tibble(
+  SQRT_INV_N_TILDA = seq(
+    min(data_cleaned_nm_herbicides$SQRT_INV_N_TILDA),
+    max(data_cleaned_nm_herbicides$SQRT_INV_N_TILDA),
+    length.out = nrow(data_cleaned_no_missing)
+  )
+) %>%
+  mutate(across(everything(), ~ .x)) %>%                      # keep the first column
+  bind_cols(as_tibble(matrix(0, nrow(.), length(X_names) - 2))) %>%  # add the other columns as 0s
+  setNames(X_names[-1])                                            # apply column names from model.matrix
+
+pred_data$`PESTICIDE_CLASSherbicide` <- 1  
+
+# predict
+publication_bias_all_mod_predictions <- predict(publication_bias_all_mod,
+                                                newmods=as.matrix(pred_data))
+
+predictions_sqrt_inv_n_tilda <- data.frame(sint = seq(min(data_cleaned_nm_herbicides$SQRT_INV_N_TILDA),
+                                                      max(data_cleaned_nm_herbicides$SQRT_INV_N_TILDA),
+                                                      length.out=nrow(data_cleaned_no_missing)),
+                                           PESTICIDE_CLASS = "herbicide",
+                                           fit = publication_bias_all_mod_predictions$pred,
+                                           upper = publication_bias_all_mod_predictions$ci.ub,
+                                           lower = publication_bias_all_mod_predictions$ci.lb)
+
+predictions_sqrt_inv_n_tilda_plot <- ggplot() +
+                                     geom_point(data = data_cleaned_no_missing,
+                                                aes(x = SQRT_INV_N_TILDA,
+                                                    y = LRR,
+                                                    group = PESTICIDE_CLASS,
+                                                    color = PESTICIDE_CLASS)) +
+                                     geom_line(data = predictions_sqrt_inv_n_tilda,
+                                               aes(x = sint,
+                                                   y = fit,
+                                                   group = PESTICIDE_CLASS,
+                                                   color = PESTICIDE_CLASS)) + 
+                                     geom_ribbon(data = predictions_sqrt_inv_n_tilda,
+                                                 aes(x = sint,
+                                                     y = fit,
+                                                     ymin = lower,
+                                                     ymax = upper,
+                                                     group = PESTICIDE_CLASS,
+                                                     color = PESTICIDE_CLASS,
+                                                     fill = PESTICIDE_CLASS),
+                                                 alpha = 0.3) +
+                                     theme_bw() +
+                                     theme(panel.grid.major = element_blank(),
+                                           panel.grid.minor = element_blank()) +
+                                     scale_color_manual(values = c("#009E73",
+                                                                   "#F0E442",
+                                                                   "#CC79A7",
+                                                                   "#56B4E9",
+                                                                   "#E69F00"
+                                                                   ),
+                                                        name = "Pesticide Class",
+                                                        labels = c("Algaecide",
+                                                                   "Anti-parasitic",
+                                                                   "Fungicide",
+                                                                   "Herbicide",
+                                                                   "Insecticide")) +
+                                     scale_fill_manual(values = c("#CC79A7"),
+                                                       name = "", labels = c("")) +
+                                     xlab("Square root of inverse of effective sample size") +
+                                     ylab("Effect size (lnRR)") +
+                                     ggtitle("Does the effect size increase in magnitude as uncertainty increases?") +
+                                     guides(color=guide_legend(override.aes=list(fill=NA, linetype=0)),
+                                            fill = "none")
+
+predictions_sqrt_inv_n_tilda_plot
+
+cairo_pdf("output/small_study_effect.pdf")
+predictions_sqrt_inv_n_tilda_plot
+dev.off()
+
+# predictions for sint = 0 and herbicide. No interaction term so 
+# relationship the same for all PESTICIDE_CLASS levels
+# Creating a prediction grid
+pred_data_cen <- pred_data <- tibble(
+  SQRT_INV_TILDA = mean(data_cleaned_nm_herbicides$SQRT_INV_N_TILDA),
+  YEAR_CEN = seq(
+    min(data_cleaned_nm_herbicides$YEAR_CEN),
+    max(data_cleaned_nm_herbicides$YEAR_CEN),
+    length.out = nrow(data_cleaned_no_missing)
+  )
+) %>%
+  mutate(across(everything(), ~ .x)) %>%                      # keep the first column
+  bind_cols(as_tibble(matrix(0, nrow(.), length(X_names) - 3))) %>%  # add the other columns as 0s
+  setNames(X_names[-1])                                            
+
+pred_data_cen$`PESTICIDE_CLASSherbicide` <- 1 
+  
+# predict  
+publication_bias_all_mod_predictions_year_cen <- predict(publication_bias_all_mod,
+                                                newmods=as.matrix(pred_data_cen))
+
+predictions_year_cen <- data.frame(YEAR_PUBLISHED = seq(min(data_cleaned_nm_herbicides$YEAR_PUBLISHED),
+                                                        max(data_cleaned_nm_herbicides$YEAR_PUBLISHED),
+                                                        length.out = nrow(data_cleaned_no_missing)),
+                                                    PESTICIDE_CLASS = "herbicide",
+                                                    fit =publication_bias_all_mod_predictions_year_cen$pred,
+                                                    upper = publication_bias_all_mod_predictions_year_cen$ci.ub,
+                                                    lower = publication_bias_all_mod_predictions_year_cen$ci.lb)
+
+
+predictions_year_cen_plot <- ggplot() +
+  geom_point(data = data_cleaned_no_missing,
+             aes(x = YEAR_PUBLISHED,
+                 y = LRR,
+                 group = PESTICIDE_CLASS,
+                 color = PESTICIDE_CLASS)) +
+  geom_line(data = predictions_year_cen,
+            aes(x = YEAR_PUBLISHED,
+                y = fit,
+                group = PESTICIDE_CLASS,
+                color = PESTICIDE_CLASS)) + 
+  geom_ribbon(data = predictions_year_cen,
+              aes(x = YEAR_PUBLISHED,
+                  y = fit,
+                  ymin = lower,
+                  ymax = upper,
+                  group = PESTICIDE_CLASS,
+                  color = PESTICIDE_CLASS,
+                  fill = PESTICIDE_CLASS),
+              alpha = 0.3) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  scale_color_manual(values = c("#009E73",
+                                "#F0E442",
+                                "#CC79A7",
+                                "#56B4E9",
+                                "#E69F00"),
+                     name = "Pesticide Class",
+                     labels = c("Algaecide", "Anti-parasitic", "Fungicide", "Herbicide", "Insecticide")) +
+  scale_fill_manual(values = c("#CC79A7"),
+                    name = "",
+                    labels = c("")) +
+  xlab("Year of Publication") +
+  ylab("Effect size (lnRR)") +
+  ggtitle("Does the effect size magnitude reduce with time?") +
+  guides(color=guide_legend(override.aes=list(fill=NA, linetype=0)),
+                                            fill = "none")
+
+predictions_year_cen_plot
+
+cairo_pdf("output/decline_effect.pdf")
+predictions_year_cen_plot
+dev.off()
+```
+*Adjusting overall effect size estimates to account for publication bias. My final model has a term where there is evidence that some groups have non-zero effects. This means I should use inverse n tilda.*
+
+```{r}
+# fit model with 1/~n. Set intercept to 0 so we can see the effect on PESTICIDE_CLASS
+publication_bias_all_mod_inv_n_tilda <- rma.mv(yi = LRR, V = structure_check_matrix,
+                                                mods= ~ 0 + INV_N_TILDA + YEAR_CEN + PESTICIDE_CLASS,
+                                                random = list(~1 | STUDY_ID,
+                                                              ~ 1 | DATA_ID,
+                                                              ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                                                struct = "AR",
+                                                data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+
+summary(publication_bias_all_mod_inv_n_tilda)
+
+# preparation to get marginalized mean (when INV_N_TILDA = 0 and YEAR_CEN = 0)
+# reference grid for a model object
+res_publication_bias_all_mod_inv_n_tilda <- qdrg(object = publication_bias_all_mod_inv_n_tilda,
+                                                 data = data_cleaned_no_missing,
+                                                 at = list(INV_N_TILDA = 0, YEAR_CEN = 0))
+
+
+# marginalized overall mean at INV_N_TILDA = 0 and YEAR_CEN = 0; also weights = "prop" or "cells" average things over proportionally. if not specified, all groups (levels) get the same weights
+mm_publication_bias_all_mod_inv_n_tilda <- emmeans(res_publication_bias_all_mod_inv_n_tilda, specs = "PESTICIDE_CLASS",
+                                                            df = publication_bias_all_mod_inv_n_tilda$ddf,
+                                                            weights = "prop")
+
+
+# extracting the mean and 95% confidence intervals
+# For the adjusted model 
+est_adj <- as.data.frame(mm_publication_bias_all_mod_inv_n_tilda) %>%
+  rename(PESTICIDE_CLASS = PESTICIDE_CLASS,
+         estimate = emmean,
+         lower = lower.CL,
+         upper = upper.CL) %>%
+  mutate(model = "adjusted") %>%
+  dplyr::select(model, PESTICIDE_CLASS, estimate, lower, upper)
+
+# for the final model
+est_final <- estim_mod_wide(final_model_reml, "final")
+
+
+
+#  Pivot wider for table display
+adj_wide <- est_adj %>%
+  pivot_wider(
+    names_from = PESTICIDE_CLASS,
+    values_from = c(estimate, lower, upper)) %>%
+  mutate(across(-model, round, digits = 4))
+
+
+
+# Changing the orders of columns
+# Get pesticide names from column suffixes
+pesticides <- sub(".*_(.*)", "\\1", grep("^estimate_", names(adj_wide), value = TRUE))
+
+# Build the desired column order
+ordered_cols <- c("model", unlist(lapply(pesticides, function(p) {
+  c(paste0("estimate_", p), paste0("lower_", p), paste0("upper_", p))
+})))
+
+# Reorder columns
+adj_wide_ordered <- adj_wide[, ordered_cols]
+
+# Combine
+combined_estimates <- bind_rows(est_final, adj_wide_ordered)
+
+# Format for output
+# Create the HTML table with grouped headers
+final_table <- combined_estimates %>%
+  mutate(across(-model, ~ round(.x, 4))) %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+#  Save
+save_kable(final_table, "output/final_pb_adjusted_comparison.pdf")
+
+write_csv(combined_estimates, "Output/final_pb_adjusted_comparison.csv")
+
+# Plot 
+
+plot_adjusted <- orchard_plot(publication_bias_all_mod_inv_n_tilda, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))+
+  ggtitle("Adjusted plot")
+
+
+cairo_pdf("output/publication_bias_orchard_plot.pdf", width = 8, height = 12)
+plot_adjusted / final_model_orchard_plot
+dev.off()
+
+plot_adjusted
+
+final_model_orchard_plot
+
+
+```
+
+*"We should treat this adjusted estimate as a possible overall estimate as a part of sensitivity analysis in which we run alternative statistical models to test the robustness of results from the original analysis".*
+
+*My adjusted estimates are slightly lower because there is a non-significant positive relationship between 1/~n and effect sizes. I think this is because there are relatively few studies with very small samples sizes so the distribution of effect sizes hasn't been thoroughly sampled at this study size. By chance the samples with very small sample sizes were pesticides that didn't represent the overall average across the whole sample size range.*
+
+
+
+
+# Imputation of missing SE data 
+
+*[nagakawa reference](https://onlinelibrary.wiley.com/doi/10.1111/ele.14144) discussing LRR imputation but it relies upon the relationship between the mean and the variance (SD). I don't think I can use it but I may be wrong.* 
+
+*Instead, below I estimate a gamma distribution of SE/ED50 and resample from it 101 times to see the effects on the model estimates. This is kind of similar to the references that mention gamma distributions in section "Category 3. Meta-analysis level strategies" of this systematic review on [dealing with missing SD](https://bmcmedresmethodol.biomedcentral.com/articles/10.1186/s12874-018-0483-0#Tab1)*
+
+
+
+
+```{r}
+# First we will try to fit a relationship between se and ec50
+
+# Creating a simplified dataset, with all the values that don't need imputation
+
+# This will be done with the previously excluded phylo rows 
+
+data_long_no_missing <- data_cleaned_not_imputed_phylo %>%
+  filter(!is.na(AI_ERROR_TYPE)) %>%
+  mutate(TDD = AI_50,
+         SE = AI_SE_INDIVIDUAL,
+         AI_FORM = "AI") %>%
+  dplyr::select(DATA_ID, TDD, SE, AI_FORM) %>%
+  bind_rows(data_cleaned_not_imputed_phylo %>%
+              filter(!is.na(FORM_ERROR_TYPE))%>%
+              mutate(TDD = FORM_50,
+                    SE = FORM_SE_INDIVIDUAL,
+                    AI_FORM = "FORM") %>%
+              dplyr::select(DATA_ID, TDD, SE, AI_FORM))
+
+data_long_missing <- data_cleaned_not_imputed_phylo %>%
+  filter(is.na(AI_ERROR_TYPE)) %>%
+  mutate(TDD = AI_50,
+         SE = AI_SE_INDIVIDUAL,
+         AI_FORM = "AI") %>%
+  dplyr::select(DATA_ID, TDD, SE, AI_FORM) %>%
+  bind_rows(data_cleaned_not_imputed_phylo %>%
+              filter(is.na(FORM_ERROR_TYPE))%>%
+              mutate(TDD = FORM_50,
+                    SE = FORM_SE_INDIVIDUAL,
+                    AI_FORM = "FORM") %>%
+              dplyr::select(DATA_ID, TDD, SE, AI_FORM))
+  
+#Check:
+n_missing_se <- data_cleaned_not_imputed_phylo %>%
+  summarise(
+    n_missing = sum(is.na(FORM_ERROR_TYPE)) + sum(is.na(AI_ERROR_TYPE))
+  )%>%
+  pull()
+
+# IS there a relationship between SE and ED50
+
+ggplot(data_long_no_missing, aes(x = TDD, y = SE))+
+  geom_point()+
+  theme_bw()
+
+# Zoom in
+
+zoomed_plot <- ggplot(data_long_no_missing, aes(x = TDD, y = SE)) +
+  geom_point(shape = 21, color = "black", size = 2) +  # Circle points
+  xlim(0, 2000) +
+  ylim(0, 200) +
+  xlab("TDD < 2000")+
+  ylab("SE < 200") + 
+  theme_bw() +
+  theme(
+    panel.grid = element_blank()  # Removes all grid lines
+  )
+
+cairo_pdf("output/se_tdd_relationship.pdf")
+zoomed_plot
+dev.off()
+
+# SE seems to increase with ED50. The data that needs to be imputed is non-random. Usually 
+# bigger ED50 values.
+
+# express se as a proportion of ed50. This controls for the large range of ED50 values and SE getting larger with ED50
+# for se/ed50
+# this would make it unitless too (so the non-equivalent units would not matter)
+
+data_long_no_missing <- data_long_no_missing %>%
+  mutate(SE_PROP_ED_50 = SE/TDD)
+
+# Plotting 
+
+prop_zoomed_plot <- ggplot(data_long_no_missing %>%
+         filter(TDD < 2000 & SE_PROP_ED_50 < 5), aes(x = TDD, y = SE_PROP_ED_50)) + 
+    geom_point(shape = 21, color = "black", size = 2) +  # Circle points
+  xlim(0, 2000) +
+  ylim(0, 5) +
+  xlab("TDD < 2000")+
+  ylab("SE/TDD < 5 ")
+  theme_bw() +
+  theme(
+    panel.grid = element_blank()  # Removes all grid lines
+  )
+
+cairo_pdf("output/se_prop_tdd_tdd_plot.pdf")
+prop_zoomed_plot
+dev.off()
+
+# Plotting the distribution od se as a proportion of mean distribution
+ggplot(data_long_no_missing, aes(x = SE_PROP_ED_50)) +
+  geom_density() +
+  xlab("SE/TDD") +
+  ylab("Density")+
+  theme_bw()
+
+
+ggplot(data_long_no_missing %>%
+         filter(SE_PROP_ED_50 < 1), aes(x = SE_PROP_ED_50)) +
+  geom_density() +
+  xlab("SE/TDD < 1") +
+  ylab("Density")+
+  theme_bw()
+
+
+# estimate the distribution the SE_PROP_ED_50 follows instead of se
+# fit a gamma distribution to the data
+
+# for < 1 add [se_imputation_df$SE_PROP_ED_50 < 1]
+SE_PROP_ED_50_gamma <- fitdist((data_long_no_missing$SE_PROP_ED_50),
+               distr = "gamma",
+               method = "mle")
+
+summary(SE_PROP_ED_50_gamma)
+
+# the > 1 values result in the odd qqplot.
+plot(SE_PROP_ED_50_gamma)
+
+# how many SEs do I need to impute in total? 
+n_missing_se
+
+SE_PROP_ED_50_gamma_imputation <- rgamma(n = n_missing_se, shape = SE_PROP_ED_50_gamma$estimate [[1]], rate = SE_PROP_ED_50_gamma$estimate [[2]])
+
+min(SE_PROP_ED_50_gamma_imputation)
+max(SE_PROP_ED_50_gamma_imputation)
+```
+*I want to impute the missing SEs, calculate the vi and fit the final model 100 times to see how sampling from the estimated gamma distribution affects the model estimates.*
+
+
+```{r}
+# Preparing
+# Don't think this is needed and factors don't work well with filter 
+# give this factor a new imputed level
+#levels(data_cleaned_no_missing$AI_ERROR_TYPE) <- c("CI_95", NA, "SE", "SD", "imputed")
+#levels(data_cleaned_no_missing$FORM_ERROR_TYPE) <- c("CI_95", NA, "SE", "SD", "imputed")
+
+# only necessary for beeswarm plot
+#levels(data_cleaned_not_imputed$AI_ERROR_TYPE) <- c("CI_95", NA, "SE", "SD", "imputed")
+#levels(data_cleaned_not_imputed$FORM_ERROR_TYPE) <- c("CI_95", NA, "SE", "SD", "imputed")
+```
+
+```{r}
+# Define a function that fits the distrib, assign the values, calculate the model 
+
+imputing <- function(data_missing, data_full, distrib) {
+  # Data missing needs to be in a long format, wih SE, TDD, AI_FORM as columns
+  n_missing <- nrow(data_missing)
+  draw_values <- rgamma(n = n_missing, shape = distrib$estimate[[1]], rate = distrib$estimate[[2]])
+  
+  data_missing <- data_missing %>%
+    mutate(SE = TDD * draw_values)
+  
+  # Split and assign
+  AI_data <- data_missing %>% filter(AI_FORM == "AI")
+  FORM_data <- data_missing %>% filter(AI_FORM == "FORM")
+  
+  data_imputed <- data_full %>%
+    mutate(
+      AI_SE_INDIVIDUAL = ifelse(is.na(AI_SE_INDIVIDUAL), AI_data$SE, AI_SE_INDIVIDUAL),
+      AI_ERROR_TYPE = ifelse(is.na(AI_ERROR_TYPE), "imputed", AI_ERROR_TYPE),
+      FORM_SE_INDIVIDUAL = ifelse(is.na(FORM_SE_INDIVIDUAL), FORM_data$SE, FORM_SE_INDIVIDUAL),
+      FORM_ERROR_TYPE = ifelse(is.na(FORM_ERROR_TYPE), "imputed", FORM_ERROR_TYPE)
+    )
+  
+  data_imputed <- data_imputed %>%
+    mutate(LRR_VAR_INDIVIDUAL = (FORM_SE_INDIVIDUAL^2 / FORM_50^2) + (AI_SE_INDIVIDUAL^2 / AI_50^2))
+  
+  
+  return(data_imputed)
+}
+
+
+```
+ This will take a long time to run, do it once and save the results 
+
+```{r}
+# # Running 100 times
+# n_run <- 100
+# # Preparing empty containers
+# imputed_data <- vector("list", n_run)
+# imputed_model <- vector("list", n_run)
+# imputed_vcv <- vector("list", n_run)
+# 
+# # Extract pesticide names from the model output
+# pesticides <- rownames(summary(final_model_reml)$beta) %>%
+#  str_remove("^PESTICIDE_CLASS")
+# 
+# # Build column names
+# cols <- c("run",
+#           paste0("estimate_", pesticides),
+#           paste0("lower_", pesticides),
+#           paste0("upper_", pesticides))
+# 
+# # Create an empty tibble for the estimates with correct columns
+# imputed_estimates <- tibble(!!!set_names(vector("list", length(cols)), cols)) %>%
+#   slice(0)
+# 
+# # For loop a 100 times
+# for (i in 1:n_run){
+#   # Imputing the data
+#   imputed_data[[i]] <- imputing(data_long_missing, data_cleaned_not_imputed_phylo, SE_PROP_ED_50_gamma)
+#   # Creating a matrix
+#   imputed_vcv[[i]]  <- metafor::vcalc(vi = imputed_data[[i]]$LRR_VAR_INDIVIDUAL,
+#                              cluster = MULTIPLE_MEASUREMENT,
+#                              time1 = TIME_SIMPLE,
+#                              phi= 0.8,
+#                              data= imputed_data[[i]])
+#   # Creating a model
+#   imputed_model[[i]] <- rma.mv(yi = LRR, V = imputed_vcv[[i]],
+#                               mod = ~ 0 + PESTICIDE_CLASS,
+#                               random = list(~1 | STUDY_ID,
+#                                             ~ 1 | DATA_ID,
+#                                             ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+#                               struct = "AR",
+#                               data = imputed_data[[i]], method = "REML", test = "t", dfs = "contain")
+# 
+#   # Get estimates and confidence intervals
+#   estimates <- as.numeric(summary(imputed_model[[i]])$beta)
+#   ci_l <- imputed_model[[i]]$ci.lb
+#   ci_u <- imputed_model[[i]]$ci.ub
+# 
+#   # Create named vectors for tidy output
+#   row <- tibble(
+#     run = i,
+#     !!!set_names(as.list(estimates), paste0("estimate_", pesticides)),
+#     !!!set_names(as.list(ci_l), paste0("lower_", pesticides)),
+#     !!!set_names(as.list(ci_u), paste0("upper_", pesticides))
+#  )
+#    imputed_estimates <- bind_rows(imputed_estimates, row)
+#  }
+
+```
+```{r}
+write_csv(imputed_estimates, "output/imputation_results_moderator_level.csv")
+```
+
+```{r}
+imputed_estimates_results <- read_csv("output/imputation_results_moderator_level.csv") 
+
+imputed_estimates_results <- imputed_estimates
+
+summary_quantiles <- imputed_estimates_results %>%
+  # Remove the run column to summarize only numeric results
+  dplyr::select(-run) %>%
+  # Pivot longer so each estimate or CI per pesticide is a row with its variable name
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  # Group by variable 
+  group_by(variable) %>%
+  # Compute quantiles per variable
+  summarise(
+    q05 = quantile(value, probs = 0.05, na.rm = TRUE),
+    median = quantile(value, probs = 0.5, na.rm = TRUE),
+    q95 = quantile(value, probs = 0.95, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Optionally, pivot wider to get rows as quantiles and columns as variables
+  pivot_longer(
+    cols = c(q05, median, q95),
+    names_to = "quantile",
+    values_to = "estimate"
+  ) %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = estimate
+  ) %>%
+  # Fix quantile order if needed
+  mutate(quantile = factor(quantile, levels = c("q05", "median", "q95"))) %>%
+  arrange(quantile)
+
+
+
+comparison <- bind_rows(summary_quantiles, est_final)  
+
+# Changing the orders of columns
+# Get pesticide names from column suffixes
+pesticides <- sub(".*_(.*)", "\\1", grep("^estimate_", names(comparison), value = TRUE))
+
+# Build the desired column order
+ordered_cols <- c("quantile", unlist(lapply(pesticides, function(p) {
+  c(paste0("estimate_", p), paste0("lower_", p), paste0("upper_", p))
+})))
+
+# Reorder columns
+comparison_ordered <- comparison[, ordered_cols]
+
+# Format for output
+# Create the HTML table with grouped headers
+final_table_comp <- comparison_ordered %>%
+  mutate(across(-quantile, ~ round(.x, 4))) %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+#  Save
+save_kable(final_table_comp, "output/effect_of_imputation_se_draws.pdf")
+```
+*my interpretation is that reimputing the SE doesn't result in much change in the LRR. Including the imputed data makes the herbicide effect size bigger but re drawing from the estimated distribution I defined to impute the SE doesn't result in much variation, particularly for herbicides and insecticides.*
+
+*when using the imputed data select the median model in terms of herbicide estimate. Impute 100 models the 50st is selected.*
+
+I'm not sure to understand the rationale behind that but I'm going to do it and then save the imputed data so that I don't have to run the long chunks again
+
+```{r}
+# # This code chunk will not work if the 100 imputations have not been done, so it's commented and the data is saved
+# # what is the median model in terms of herbicide LRR estimate?
+# # Order the estimates according to herbicide estimate
+# median_herbicide_run <- imputed_estimates_results %>%
+#   arrange(estimate_herbicide) %>%
+#   slice(50)%>%
+#   pull(run)
+# 
+# data_cleaned_imputed <- imputed_data[[median_herbicide_run]]
+# 
+# write_csv(data_cleaned_imputed, "output/results_imputation.csv")
+```
+
+```{r}
+data_cleaned_imputed_with_phylo <- read_csv("output/results_imputation.csv")%>%
+  mutate(AI_NAME = str_to_lower(AI_NAME))
+
+data_cleaned_imputed <- data_cleaned_imputed_with_phylo %>%
+  filter(!REASON_EXCLUSION %in% c("microbial_or_cells","Name_not_in_open_tree"))
+```
+
+
+
+# Sensitivity analysis 
+
+```{r}
+# Define a function that fits a model and estimates 
+fit_mod <- function(data){
+  matrix <- metafor::vcalc(vi = data$LRR_VAR_INDIVIDUAL,
+                             cluster = MULTIPLE_MEASUREMENT,
+                             time1 = TIME_SIMPLE,
+                             phi= 0.8,
+                             data= data)
+
+  model <- rma.mv(yi = LRR, V = matrix,
+                                mod = ~ 0 + PESTICIDE_CLASS,
+                                random = list(~1 | STUDY_ID,
+                                              ~ 1 | DATA_ID,
+                                              ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                                struct = "AR",
+                                data = data, method = "REML", test = "t", dfs = "contain")
+
+  
+  return(model)
+}
+```
+
+
+## Imputation of the data 
+
+### Without phylo 
+
+#### Table
+
+```{r}
+# With imputed data without phylo
+
+imputed_model <- fit_mod(data_cleaned_imputed)
+
+est_imputed <- estim_mod_wide(imputed_model, "with_imputed")
+
+# Without 
+
+est_final <- estim_mod_wide(final_model_reml, "without_imputed") 
+
+# Joining 
+
+comparison_imputation <- bind_rows(est_imputed, est_final)
+
+
+
+```
+### With phylo 
+
+```{r}
+
+imputed_model_with <- fit_mod(data_cleaned_imputed_with_phylo)
+
+est_imputed_with <- estim_mod_wide(imputed_model_with, "with_imputed_with_phylo")
+
+# Without 
+
+not_imp_mod_with <- fit_mod(data_cleaned_no_missing_phylo)
+
+est_not_imputed_with <- estim_mod_wide(not_imp_mod_with, "without_imputed_with_phylo")
+
+# Joining 
+
+comparison_imputation_with <- bind_rows(est_imputed_with, est_not_imputed_with)
+
+
+# Joining all 
+
+comparison_all <- bind_rows(comparison_imputation_with, comparison_imputation)
+
+# Saving 
+
+final_table_all <- comparison_all %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(final_table_all, "output/imputed_non_imputed_phylo_comparison.pdf")
+
+
+```
+
+
+#### Plot 
+
+
+```{r}
+imputed_model_plot <- orchard_plot(imputed_model, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))
+
+imputed_model_phylo_plot <- orchard_plot(imputed_model_with, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))
+
+not_imputed_phylo_plot <- orchard_plot(not_imp_mod_with, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))
+
+# Add titles to the plots
+p1 <- imputed_model_plot + ggtitle("Imputed Model (Without Excluded)")
+p2 <- imputed_model_phylo_plot + ggtitle("Imputed Model (With EXcluded)")
+p3 <- not_imputed_phylo_plot + ggtitle("Not Imputed Model (With Excluded)")
+p4 <- final_model_orchard_plot + ggtitle("Not Imputed Model (Without Excluded)")
+
+# Open the PDF
+cairo_pdf("output/imputed_comparison_orchard_plot.pdf", width = 10, height = 12)
+
+# Print plots with titles
+(p1 + p2) / (p4 + p3)  # stacked vertically
+
+# Close the device
+dev.off()
+
+
+```
+
+
+
+This chunk decides whether to include the phylo excluded or not 
+
+```{r}
+# data_cleaned_not_imputed <- data_cleaned_not_imputed_phylo
+# data_cleaned_imputed <- data_cleaned_imputed_with_phylo 
+```
+
+## Effect of glyphosate
+
+### Glyphosate vs other herbicides
+
+```{r}
+data_not_imputed_glyphosate <- data_cleaned_no_missing %>%
+  filter(AI_NAME %in% c("glyphosate", "glyphosate-ipa", "glyphosate ipa salt"))
+
+data_herbicide_no_glyphosate <- data_cleaned_no_missing%>%
+  filter(PESTICIDE_CLASS == "herbicide") %>%
+    filter(!AI_NAME %in% c("glyphosate", "glyphosate-ipa", "glyphosate ipa salt"))
+
+matrix_no_gly <- metafor::vcalc(vi = data_herbicide_no_glyphosate$LRR_VAR_INDIVIDUAL,
+                             cluster = MULTIPLE_MEASUREMENT,
+                             time1 = TIME_SIMPLE,
+                             phi= 0.8,
+                             data= data_herbicide_no_glyphosate)
+
+mod_no_gly <- rma.mv(yi = LRR, V = matrix_no_gly,
+                              mod = ~ 1,
+                              random = list(~1 | STUDY_ID,
+                                            ~ 1 | DATA_ID,
+                                            ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                              struct = "AR",
+                              data = data_herbicide_no_glyphosate, method = "REML", test = "t", dfs = "contain")
+
+
+robust(mod_no_gly, cluster = data_herbicide_no_glyphosate$STUDY_ID, clubSandwich = TRUE)
+
+matrix_gly <- metafor::vcalc(vi = data_not_imputed_glyphosate$LRR_VAR_INDIVIDUAL,
+                             cluster = MULTIPLE_MEASUREMENT,
+                             time1 = TIME_SIMPLE,
+                             phi= 0.8,
+                             data= data_not_imputed_glyphosate)
+
+mod_gly <- rma.mv(yi = LRR, V = matrix_gly,
+                              mod = ~ 1,
+                              random = list(~1 | STUDY_ID,
+                                            ~ 1 | DATA_ID,
+                                            ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                              struct = "AR",
+                              data = data_not_imputed_glyphosate, method = "REML", test = "t", dfs = "contain")
+
+
+robust(mod_gly, cluster = data_not_imputed_glyphosate$STUDY_ID, clubSandwich = TRUE)
+
+est_gly <- estim_mod_wide(mod_gly, "glyphosate only")
+est_no_gly <- estim_mod_wide(mod_no_gly, "herbicides without glyphosate")
+
+comp_gly <- bind_rows(est_gly, est_no_gly)
+
+# Saving 
+
+table_gly <- comp_gly %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 1))) %>%
+  add_header_above(c(" " = 1,
+                     "Herbicide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(table_gly, "output/glyphosate_herbicide_comparison.pdf")
+
+
+```
+### Imputation on glyphosate
+
+```{r}
+imputed_glyphosate <- data_cleaned_imputed %>%
+    filter(AI_NAME %in% c("glyphosate", "glyphosate-ipa", "glyphosate ipa salt"))
+
+
+matrix_gly_imp <- metafor::vcalc(vi = imputed_glyphosate$LRR_VAR_INDIVIDUAL,
+                             cluster = MULTIPLE_MEASUREMENT,
+                             time1 = TIME_SIMPLE,
+                             phi= 0.8,
+                             data= imputed_glyphosate)
+
+mod_gly_imp <- rma.mv(yi = LRR, V = matrix_gly_imp,
+                              mod = ~ 1,
+                              random = list(~1 | STUDY_ID,
+                                            ~ 1 | DATA_ID,
+                                            ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                              struct = "AR",
+                              data = imputed_glyphosate, method = "REML", test = "t", dfs = "contain")
+
+# Doing a table
+
+est_gly_imp <- estim_mod_wide(mod_gly_imp, "glyphosate only imputation")
+
+comp_gly_imp <- bind_rows(est_gly, est_gly_imp)
+
+table_gly_imp <- comp_gly_imp %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 1))) %>%
+  add_header_above(c(" " = 1,
+                     "Herbicide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(table_gly_imp, "output/glyphosate_imputation_comparison.pdf")
+
+
+# Plots 
+
+gly_imp_plot <- orchard_plot(mod_gly_imp,
+                                        xlab = "Effect size lnRR",
+                                        group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#90EE90")) +
+  scale_colour_manual(values = c("#90EE90")) +
+  ggtitle("Glyphosate with imputation")
+
+gly_plot <- orchard_plot(mod_gly,
+                                        xlab = "Effect size lnRR",
+                                        group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#90EE90")) +
+  scale_colour_manual(values = c("#90EE90")) +
+  ggtitle("Glyphosate without imputation")
+
+herb_plot <- orchard_plot(mod_no_gly,
+                                        xlab = "Effect size lnRR",
+                                        group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#90EE90")) +
+  scale_colour_manual(values = c("#90EE90")) +
+  ggtitle("Other herbicides without imputation")
+
+
+cairo_pdf("output/glyphosate_comparison_orchard_plot.pdf")
+gly_imp_plot / gly_plot
+dev.off()
+
+cairo_pdf("output/glyphosate_herb_comparison_orchard_plot.pdf")
+herb_plot / gly_plot
+dev.off()
+
+```
+## Regulatory guidelines 
+
+Note: analysis made without using the imputed data 
+
+```{r}
+# Fitting the models and computing estimates 
+guidelines_followed <- data_cleaned_no_missing %>%
+  filter(REGULATORY_STANDARDISED_GUIDELINES_FOLLOWED == "YES")
+
+no_guidelines_followed <- data_cleaned_no_missing %>%
+  filter(REGULATORY_STANDARDISED_GUIDELINES_FOLLOWED == "NO")
+
+guidelines_mod <- fit_mod(guidelines_followed)
+
+est_gdl <- estim_mod_wide(guidelines_mod, "Guidelines followed")
+
+no_guidelines_mod <- fit_mod(no_guidelines_followed)
+
+est_no_gdl <- estim_mod_wide(no_guidelines_mod, "No guidelines followed")
+
+est_all <- estim_mod_wide(final_model_reml, "All")
+
+# Creating a table
+
+comp_gdl <- bind_rows(est_gdl, est_no_gdl, est_all)
+
+table_gdl <- comp_gdl %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(table_gdl, "output/guidelines_comparison.pdf")
+
+# Creating a plot 
+
+gdl_plot <- orchard_plot(guidelines_mod, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))+
+  ggtitle("Guidelines followed")
+
+
+no_gdl_plot <- orchard_plot(no_guidelines_mod, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c( "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c( "#CC79A7", "#56B4E9", "#E69F00"))+
+  ggtitle("No Guidelines followed")
+
+all_plot <- orchard_plot(final_model_reml, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))+
+  ggtitle("All data not imputed")
+
+
+cairo_pdf("output/guidelines_comparison_orchard_plot.pdf", width = 8, height = 13)
+gdl_plot / no_gdl_plot / all_plot
+dev.off() 
+```
+
+## Varying the correlation coefficients for VCV matrix (0.1-0.9)
+
+Note: With the not imputed data only 
+
+```{r}
+rho_range <- seq(0.5, 0.95, by = 0.05)
+
+rho_est <- est_final
+
+for (i in 1:length(rho_range)){
+  rho_matrix <- metafor::vcalc(vi = data_cleaned_no_missing$LRR_VAR_INDIVIDUAL,
+                             cluster = MULTIPLE_MEASUREMENT,
+                             time1 = TIME_SIMPLE,
+                             phi= rho_range[i],
+                             data= data_cleaned_no_missing)
+
+  rho_model <- rma.mv(yi = LRR, V = rho_matrix,
+                                mod = ~ 0 + PESTICIDE_CLASS,
+                                random = list(~1 | STUDY_ID,
+                                              ~ 1 | DATA_ID,
+                                              ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                                struct = "AR",
+                                data = data_cleaned_no_missing, method = "REML", test = "t", dfs = "contain")
+  
+  est <- estim_mod_wide(rho_model, paste0("rho = ", rho_range[i]))
+  
+  rho_est <- bind_rows(rho_est, est)
+  
+}
+
+table_rho <- rho_est %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(table_rho, "output/rho_results_moderator_level.pdf")
+
+```
+## Excluded effect sizes
+
+
+```{r}
+excluded_errorbig <- excluded %>%
+  filter(REASON_EXCLUSION == "Error_supp_10_times_value")
+
+
+excluded_influential <- excluded %>%
+  filter(REASON_EXCLUSION == "Influential_fungicide_seeGuy")
+
+# Fitting model
+
+data_cleaned_no_missing_witherror <- bind_rows(data_cleaned_no_missing, excluded_errorbig)
+
+mod_errorbig <- fit_mod(data_cleaned_no_missing_witherror)
+
+est_errorbig <- estim_mod_wide(mod_errorbig, "With error > 10 TDD")
+
+
+data_cleaned_no_missing_winfluential <- bind_rows(data_cleaned_no_missing, excluded_influential)
+
+mod_influential <- fit_mod(data_cleaned_no_missing_winfluential)
+
+est_influential <- estim_mod_wide(mod_influential,"With influential fungicides" )
+# Table 
+
+comp_excluded <- bind_rows(est_errorbig, est_final, est_influential)
+
+table_excluded <- comp_excluded %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(table_excluded, "output/influence_excluded.pdf")
+
+# Plots 
+
+
+errorbig_plot <- orchard_plot(mod_errorbig, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))+
+  ggtitle("With error > 10 TDD")
+
+influential_plot <- orchard_plot(mod_influential, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))+
+  ggtitle("With influential fungicides")
+
+cairo_pdf("output/excluded_comparison_orchard_plot.pdf", width = 8, height = 15)
+errorbig_plot / influential_plot / final_model_orchard_plot
+dev.off() 
+```
+
+Note: One row of the excluded is omitted because it needs to be computed but there's very few data points in the first place (it was extracted from figures so maybe best like this)
+
+## Only animals
+
+```{r}
+# Filtering 
+data_cleaned_no_missing_animals <- data_cleaned_no_missing %>%
+  filter(SPECIES_KINGDOM == "Animalia")
+
+# Fit the model 
+
+mod_animals <- fit_mod(data_cleaned_no_missing_animals)
+
+est_animals <- estim_mod_wide(mod_animals, "Animals")
+
+# Table
+
+comp_animals <- bind_rows(est_animals, est_all)
+
+table_animals <- comp_animals %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(table_animals, "output/animals_comparison.pdf")
+
+# Plots 
+
+
+animals_plot <- orchard_plot(mod_animals, 
+                                         mod = "PESTICIDE_CLASS", 
+                                         xlab = "Effect size lnRR", 
+                                         group = "STUDY_ID",  k = TRUE, g = TRUE, trunk.size = 1.5) +
+  scale_fill_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00")) +
+  scale_colour_manual(values = c("#009E73", "#F0E442", "#CC79A7", "#56B4E9", "#E69F00"))+
+  ggtitle("Animals only")
+
+
+cairo_pdf("output/animals_comparison_orchard_plot.pdf", width = 8, height = 15)
+animals_plot / all_plot
+dev.off() 
+
+```
+## Sample size 
+
+*Below I also rerun my final model using LRR variance values calculated using SEs extracted on the assumption:*
+
+*1) Container level sample size was used when performing the primary analysis
+2) Effective Sample size where a 0.046 ICC was used, which was calculated from a paper within the meta-analysis
+3) Effective Sample size where a 0.4ish ICC, as this was the maximum ICC from the papers within the meta-analysis where an ICC could be calculated.
+*
+*No difference in the effects.*
+
+
+```{r}
+# Creating a new dataset and using container sample size
+# However it can't be sample size can't be 1 so have to change it first 
+
+sample_size_sensitivity_df <- data_cleaned_no_missing %>%
+  mutate(
+    # Force n = 2 if n = 1
+    AI_N_CONTAINER = if_else(AI_N_CONTAINER == 1, 2L, AI_N_CONTAINER),  
+    FORM_N_CONTAINER = if_else(FORM_N_CONTAINER == 1, 2L, FORM_N_CONTAINER),
+    # Computing SE for CI and SD
+    AI_SE_CONTAINER = case_when(
+      AI_ERROR_TYPE == "CI_95" ~ AI_BIGGEST_CI_ARM / -qt(.025, df = AI_N_CONTAINER -1),
+      AI_ERROR_TYPE == "SD" ~ AI_ERROR_LOWER/sqrt(AI_N_CONTAINER),
+      AI_ERROR_TYPE == "SE" ~ AI_SE_INDIVIDUAL
+    ),
+    FORM_SE_CONTAINER = case_when(
+      FORM_ERROR_TYPE == "CI_95" ~ FORM_BIGGEST_CI_ARM / -qt(.025, df = FORM_N_CONTAINER -1),
+      FORM_ERROR_TYPE == "SD" ~ FORM_ERROR_LOWER/sqrt(FORM_N_CONTAINER),
+      FORM_ERROR_TYPE == "SE" ~ FORM_SE_INDIVIDUAL
+    ),
+    # Average cluster size
+    AVERAGE_CLUSTER_SIZE = ((AI_N_CONTAINER*AI_N_INDIVIDUALS_PER_CONTAINER)+ (FORM_N_CONTAINER*FORM_N_INDIVIDUALS_PER_CONTAINER)) / (AI_N_CONTAINER + FORM_N_CONTAINER),
+    # Design effect for 0.442 ICC
+    DESIGN_EFFECT_0.442_ICC = 1 + (AVERAGE_CLUSTER_SIZE - 1) * 0.442, 
+     # ESS for ai based on 0.442 ICC
+    AI_ESS_0.442_ICC = AI_N_INDIVIDUAL / DESIGN_EFFECT_0.442_ICC,
+    # ESS for form based on 0.442 ICC
+    FORM_ESS_0.442_ICC = FORM_N_INDIVIDUAL / DESIGN_EFFECT_0.442_ICC,
+    # design effect for 0.046 ICC
+    DESIGN_EFFECT_0.046_ICC = 1 + (AVERAGE_CLUSTER_SIZE - 1) * 0.046,
+    # ESS for ai based on 0.046 ICC
+    AI_ESS_0.046_ICC = AI_N_INDIVIDUAL / DESIGN_EFFECT_0.046_ICC,
+    # ESS for FORM based on 0.046 ICC
+    FORM_ESS_0.046_ICC = FORM_N_INDIVIDUAL / DESIGN_EFFECT_0.046_ICC,
+    # FORM SE calculation using ESS (ICC = 0.442)
+    FORM_SE_ESS_0.442 = case_when(
+      FORM_ERROR_TYPE == "CI_95" ~ FORM_BIGGEST_CI_ARM / -qt(.025, df = FORM_ESS_0.442_ICC -1),
+      FORM_ERROR_TYPE == "SD" ~ FORM_ERROR_LOWER/sqrt(FORM_ESS_0.442_ICC),
+      FORM_ERROR_TYPE == "SE" ~ FORM_SE_INDIVIDUAL
+    ),
+    # FORM SE calculation using ESS (ICC = 0.046)
+    FORM_SE_ESS_0.446 = case_when(
+      FORM_ERROR_TYPE == "CI_95" ~ FORM_BIGGEST_CI_ARM / -qt(.025, df = FORM_ESS_0.046_ICC -1),
+      FORM_ERROR_TYPE == "SD" ~ FORM_ERROR_LOWER/sqrt(FORM_ESS_0.046_ICC),
+      FORM_ERROR_TYPE == "SE" ~ FORM_SE_INDIVIDUAL
+    ),
+    # AI SE calculation using ESS (ICC = 0.442)
+    AI_SE_ESS_0.442 = case_when(
+      AI_ERROR_TYPE == "CI_95" ~ AI_BIGGEST_CI_ARM / -qt(.025, df = AI_ESS_0.442_ICC -1),
+      AI_ERROR_TYPE == "SD" ~ AI_ERROR_LOWER/sqrt(AI_ESS_0.442_ICC),
+      AI_ERROR_TYPE == "SE" ~ AI_SE_INDIVIDUAL
+    ), 
+    # AI SE calculation using ESS (ICC = 0.046)
+    AI_SE_ESS_0.446 = case_when(
+      AI_ERROR_TYPE == "CI_95" ~ AI_BIGGEST_CI_ARM / -qt(.025, df = AI_ESS_0.046_ICC -1),
+      AI_ERROR_TYPE == "SD" ~ AI_ERROR_LOWER/sqrt(AI_ESS_0.046_ICC),
+      AI_ERROR_TYPE == "SE" ~ AI_SE_INDIVIDUAL
+    ), 
+    # Computing the LRR variance
+    LRR_VAR_CONTAINER = (FORM_SE_CONTAINER^2 / FORM_50^2) + (AI_SE_CONTAINER^2 / AI_50^2),
+    # ICC 0.442 SE variance
+    LRR_VAR_CONTAINER_0.442 = (FORM_SE_ESS_0.442^2 / FORM_50^2) + (AI_SE_ESS_0.442^2 / AI_50^2),
+    # ICC 0.046 SE variance
+    LRR_VAR_CONTAINER_0.046 = (FORM_SE_ESS_0.446^2 / FORM_50^2) + (AI_SE_ESS_0.446^2 / AI_50^2))    
+          
+
+# specify the final model 4 times with the different variances and compare results
+# Cannot use fitmod because the columns are different 
+# final model with individual_level_vi
+indiv_sample_autocorrelation_matrix <- metafor::vcalc(vi = sample_size_sensitivity_df$LRR_VAR_INDIVIDUAL,
+               cluster = MULTIPLE_MEASUREMENT,
+               time1 = TIME_SIMPLE,
+               phi= 0.8,
+               data= sample_size_sensitivity_df)
+
+indiv_sample_final_model <- rma.mv(yi = LRR, V = indiv_sample_autocorrelation_matrix,
+                    mod = ~ 0 + PESTICIDE_CLASS,
+                    random = list(~1 | STUDY_ID,
+                                  ~ 1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = sample_size_sensitivity_df, method = "REML", test = "t", dfs = "contain")
+
+summary(indiv_sample_final_model)
+
+# RVE
+robust(indiv_sample_final_model, cluster = sample_size_sensitivity_df$STUDY_ID, clubSandwich = TRUE)
+
+# final model with icc_0.046_level_vi
+icc_0.046_sample_autocorrelation_matrix <- metafor::vcalc(vi = sample_size_sensitivity_df$LRR_VAR_CONTAINER_0.046,
+               cluster = MULTIPLE_MEASUREMENT,
+               time1 = TIME_SIMPLE,
+               phi= 0.8,
+               data= sample_size_sensitivity_df)
+
+icc_0.046_sample_final_model <- rma.mv(yi = LRR, V = icc_0.046_sample_autocorrelation_matrix,
+                    mod = ~ 0 + PESTICIDE_CLASS,
+                    random = list(~1 | STUDY_ID,
+                                  ~ 1 | DATA_ID,
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = sample_size_sensitivity_df, method = "REML", test = "t", dfs = "contain")
+
+summary(icc_0.046_sample_final_model)
+
+# RVE
+robust(icc_0.046_sample_final_model, cluster = sample_size_sensitivity_df$STUDY_ID, clubSandwich = TRUE)
+
+# final model with icc_0.442_level_vi
+icc_0.442_sample_autocorrelation_matrix <- metafor::vcalc(vi = sample_size_sensitivity_df$LRR_VAR_CONTAINER_0.442,
+               cluster = MULTIPLE_MEASUREMENT,
+               time1 = TIME_SIMPLE,
+               phi= 0.8,
+               data= sample_size_sensitivity_df)
+
+icc_0.442_sample_final_model <- rma.mv(yi = LRR, V = icc_0.442_sample_autocorrelation_matrix,
+                    mod = ~ 0 + PESTICIDE_CLASS,
+                    random = list(~1 | STUDY_ID,
+                                  ~ 1 | DATA_ID,                                  
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = sample_size_sensitivity_df, method = "REML", test = "t", dfs = "contain")
+
+summary(icc_0.442_sample_final_model)
+
+# RVE
+robust(icc_0.442_sample_final_model, cluster = sample_size_sensitivity_df$STUDY_ID, clubSandwich = TRUE)
+
+# final model with container_level_vi
+container_sample_autocorrelation_matrix <- metafor::vcalc(vi = sample_size_sensitivity_df$LRR_VAR_CONTAINER,
+               cluster = MULTIPLE_MEASUREMENT,
+               time1 = TIME_SIMPLE,
+               phi= 0.8,
+               data= sample_size_sensitivity_df)
+
+container_sample_final_model <- rma.mv(yi = LRR, V = container_sample_autocorrelation_matrix,
+                    mod = ~ 0 + PESTICIDE_CLASS,
+                    random = list(~1 | STUDY_ID,
+                                  ~ 1 | DATA_ID,                                  
+                                  ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                    struct = "AR",
+                    data = sample_size_sensitivity_df, method = "REML", test = "t", dfs = "contain")
+
+summary(container_sample_final_model)
+
+# RVE
+robust(container_sample_final_model, cluster = sample_size_sensitivity_df$STUDY_ID, clubSandwich = TRUE)
+
+# table
+lrr_variances_comparison_table_df <- bind_rows(estim_mod_wide(indiv_sample_final_model, "individual"),
+                                               estim_mod_wide(icc_0.046_sample_final_model,"effective, ICC = 0.046" ),
+                                               estim_mod_wide(icc_0.442_sample_final_model, "effective, ICC = 0.442"),
+                                               estim_mod_wide(container_sample_final_model, "container"))
+
+table_samplesize <- lrr_variances_comparison_table_df %>%
+  knitr::kable("html",
+               digits = 4,
+               col.names = c("Model",
+                             rep(c("Estimate", "Lower CI", "Upper CI"), 5))) %>%
+  add_header_above(c(" " = 1,
+                     "Algaecide" = 3,
+                     "Anti-parasitic" = 3,
+                     "Fungicide" = 3,
+                     "Herbicide" = 3,
+                     "Insecticide" = 3)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+
+
+save_kable(table_samplesize, "output/samplesize_comparison.pdf")
+
+
+write_csv(lrr_variances_comparison_table_df, "output/sample_size_variance_comparison.csv")
+```
+*Look for the decline effect in glyphosate/roundup studies. Not present in either the non-imputed or imputed datasets. This is a pretty crude analysis. I've based Roundup composition changing according to year, which may not be strictly be true. Some of the countries these tests were performed in may have less stringent regulatory bodies, where it takes longer to restrict more toxic co-formulants.*
+
+
+```{r}
+
+# imputed
+roundup_only_imputed  <- data_cleaned_imputed_with_phylo %>%
+  filter(str_detect(FORM_NAME, "Roundup")) %>%
+  mutate(YEAR_CEN = YEAR_PUBLISHED - mean(YEAR_PUBLISHED, na.rm = TRUE))
+
+# not imputed
+roundup_only <- data_cleaned_no_missing_phylo %>%
+  filter(str_detect(FORM_NAME, "Roundup")) %>%
+  mutate(YEAR_CEN = YEAR_PUBLISHED - mean(YEAR_PUBLISHED, na.rm = TRUE))
+
+# Fitting models 
+# Not imputed
+  
+autocorrelation_matrix_roundup <- metafor::vcalc(vi = roundup_only$LRR_VAR_INDIVIDUAL,
+                                       cluster = MULTIPLE_MEASUREMENT,
+                                       time1 = TIME_SIMPLE,
+                                       phi= 0.8,
+                                       data= roundup_only)
+  
+roundup_model <- rma.mv(yi = LRR, V = autocorrelation_matrix_roundup,
+                                          mod = ~ YEAR_CEN,
+                                          random = list(~1 | STUDY_ID,
+                                                        ~ 1 | DATA_ID,
+                                                        ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                                          struct = "AR",
+                                          data = roundup_only, method = "REML", test = "t", dfs = "contain")
+  
+summary(roundup_model)
+
+robust(roundup_model, cluster = roundup_only$STUDY_ID, clubSandwich = TRUE)
+
+roundup_year_cen_pred <- predict(roundup_model,
+                                 newmods = seq(min(roundup_only$YEAR_CEN),
+                                               max(roundup_only$YEAR_CEN),
+                                               length.out = nrow(roundup_only)))
+
+predictions_roundup <- data.frame(YEAR_PUBLISHED = seq(min(roundup_only$YEAR_PUBLISHED),
+                                                       max(roundup_only$YEAR_PUBLISHED),
+                                                       length.out=nrow(roundup_only)),
+                                  fit = roundup_year_cen_pred$pred,
+                                  upper = roundup_year_cen_pred$ci.ub,
+                                  lower = roundup_year_cen_pred$ci.lb)
+
+roundup_plot <- ggplot() +
+  geom_point(data = roundup_only, aes(x = YEAR_PUBLISHED, y = LRR)) +
+  geom_line(data = predictions_roundup, aes(x = YEAR_PUBLISHED, y = fit)) +
+  geom_ribbon(data = predictions_roundup, aes(x = YEAR_PUBLISHED, y = fit, ymin = lower, ymax = upper, alpha = 0.3)) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("Year of Publication") +
+  ylab("Effect size (lnRR)") +
+  ggtitle("Does the effect size magnitude for Roundup formulations reduce with time?") +
+  theme(legend.position = "none")
+
+# Imputed
+
+
+autocorrelation_matrix_roundup_imp <- metafor::vcalc(vi = roundup_only_imputed$LRR_VAR_INDIVIDUAL,
+                                       cluster = MULTIPLE_MEASUREMENT,
+                                       time1 = TIME_SIMPLE,
+                                       phi= 0.8,
+                                       data= roundup_only_imputed)
+  
+roundup_model_imp <- rma.mv(yi = LRR, V = autocorrelation_matrix_roundup_imp,
+                                          mod = ~ YEAR_CEN,
+                                          random = list(~1 | STUDY_ID,
+                                                        ~ 1 | DATA_ID,
+                                                        ~ TIME_SIMPLE | MULTIPLE_MEASUREMENT),
+                                          struct = "AR",
+                                          data = roundup_only_imputed, method = "REML", test = "t", dfs = "contain")
+
+summary(roundup_model_imp)
+
+robust(roundup_model_imp, cluster = roundup_only_imputed$STUDY_ID, clubSandwich = TRUE)
+
+roundup_year_cen_pred_imp <- predict(roundup_model_imp,
+                                 newmods = seq(min(roundup_only_imputed$YEAR_CEN),
+                                               max(roundup_only_imputed$YEAR_CEN),
+                                               length.out = nrow(roundup_only_imputed)))
+
+predictions_roundup_imp <- data.frame(YEAR_PUBLISHED = seq(min(roundup_only_imputed$YEAR_PUBLISHED),
+                                                       max(roundup_only_imputed$YEAR_PUBLISHED),
+                                                       length.out=nrow(roundup_only_imputed)),
+                                  fit = roundup_year_cen_pred_imp$pred,
+                                  upper = roundup_year_cen_pred_imp$ci.ub,
+                                  lower = roundup_year_cen_pred_imp$ci.lb)
+
+roundup_plot_imp <- ggplot() +
+  geom_point(data = roundup_only_imputed, aes(x = YEAR_PUBLISHED, y = LRR)) +
+  geom_line(data = predictions_roundup_imp, aes(x = YEAR_PUBLISHED, y = fit)) +
+  geom_ribbon(data = predictions_roundup_imp, aes(x = YEAR_PUBLISHED, y = fit, ymin = lower, ymax = upper, alpha = 0.3)) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("Year of Publication") +
+  ylab("Effect size (lnRR)") +
+  ggtitle("Does the effect size magnitude for Roundup formulations reduce with time? (Imputed data)") +
+  theme(legend.position = "none")
+  
+cairo_pdf("output/roundup_decline_effect_plot.pdf")
+roundup_plot
+roundup_plot_imp
+dev.off()
+```
+
+# Counts 
+
+```{r}
+# Chose the dataset to analyse
+final_data <- data_cleaned_no_missing  
+
+# how many AIs are there in the final dataset?
+length(sort(unique(final_data$AI_NAME))) 
+
+# how many formulations?
+length(sort(unique(final_data$FORM_NAME))) - 3
+
+# formulation types
+length(sort(unique(final_data$FORMULATION_TYPE)))
+
+# number of species and phyla
+length(sort(unique(final_data$SPECIES_NAME_BINOMIAL_OTL)))
+length(sort(unique(final_data$SPECIES_PHYLUM)))
+
+# how many in each pesticide class?
+sort(table(final_data$PESTICIDE_CLASS),decreasing=TRUE)
+
+# how many of each AI
+sort(table(final_data$AI_NAME),decreasing=TRUE)
+
+# how many of each FORM
+sort(table(final_data$FORM_NAME),decreasing=TRUE)
+
+# how many of each species
+sort(table(final_data$SPECIES_NAME_BINOMIAL_OTL),decreasing=TRUE)
+
+# how many of each formulation type
+sort(table(final_data$FORMULATION_TYPE),decreasing=TRUE)
+
+# regulatory guidelines followed
+sort(table(final_data$REGULATORY_STANDARDISED_GUIDELINES_FOLLOWED),decreasing=TRUE)
+
+# kingdom proportions
+sort(table(final_data$SPECIES_KINGDOM),decreasing=TRUE)
+
+# span of years
+sort(final_data$YEAR_PUBLISHED)
+
+# how many of the imputed effect sizes were herbicides
+nrow(data_missing_cleaned [data_missing_cleaned$PESTICIDE_CLASS == "herbicide", ])
+
+# how many of these had more toxic formulations
+nrow(data_missing_cleaned [(data_missing_cleaned$PESTICIDE_CLASS == "herbicide") & (data_missing_cleaned$AI_50 > data_missing_cleaned$FORM_50), ])
+
+# what proportion of the herbicide effect sizes did glyphosate represent?
+sort(table(final_data [final_data$PESTICIDE_CLASS == "herbicide", ]$AI_NAME), decreasing=TRUE)
+
+# how many formulation types were present for herbicides in full dataset
+unique(final_data [final_data$PESTICIDE_CLASS == "herbicide", ]$FORMULATION_TYPE)
+
+# how many formulation types were present for insecticides in full dataset
+unique(final_data [final_data$PESTICIDE_CLASS == "insecticide", ]$FORMULATION_TYPE)
+```
+
+# Plot of relative PPP mortality.
+
+*Fit an intercept only model. Generate an Orchard plot, then put horizontal dashed lines denoting the half and double toxic thresholds. Use the imputed data as I am only looking at the LRR for this, which isn't impacted by SE.*
+
+```{r}
+
+
+color_above <- log(2)
+color_below <- log(0.5)
+
+
+data_cleaned_imputed_with_phylo <- data_cleaned_imputed_with_phylo %>%
+  mutate(color = if_else(LRR > log(2) | LRR < log(0.5), "color", NA_character_))
+
+nabove <- data_cleaned_imputed_with_phylo %>% filter(LRR > log(2)) %>% nrow()
+nbelow <-  data_cleaned_imputed_with_phylo %>% filter(LRR < log(0.5)) %>% nrow()
+
+factor_two_mortality_diff_plot <- ggplot(data_cleaned_imputed_with_phylo, aes(x = "", y = LRR, size = 1/sqrt(LRR_VAR_INDIVIDUAL), alpha = 0.5, color = color)) +
+  geom_quasirandom() +
+  coord_flip() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  ylab("Effect Size (lnRR)") +
+  xlab("") +
+  
+  geom_hline(yintercept = 0, linetype = 2, colour = "black", alpha = 0.5) +
+  geom_hline(yintercept = log(0.5), linetype = 2, colour = "#8B0000", alpha = 0.5) +
+  geom_hline(yintercept = log(2), linetype = 2, colour = "#8B0000", alpha = 0.5) +
+  ggtitle("PPP, AI pairs where mortality differs by > factor 2") +
+  scale_color_manual(values = "#8B0000") +
+  annotate("text", x = 1.5, y = -4, label = paste0("Effect sizes < ln(0.5) = ",
+                                                   nbelow, sep = "")) +
+  annotate("text", x = 1.5, y = 0, label = paste0("Effect sizes > ln(2) = ",
+                                                 nabove, sep = ""))
+
+factor_two_mortality_diff_plot
+
+# use cowplot to create a grid
+cairo_pdf("output/factor_two_mortality_diff_plot.pdf", width = 10, height = 6)
+factor_two_mortality_diff_plot
+dev.off()
+```

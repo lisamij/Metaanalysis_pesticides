@@ -30,3 +30,5 @@ The files from the precedent section were modified following the implementation 
 Essentially, this modification concerned the columns for the control and test groups, that need to be specified according the formatted documents. 
 
 Most of the time, the output of a section becomes the input of the following one. 
+
+PRISMA Eco-Evo guidelines are reported.
